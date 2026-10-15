@@ -117,10 +117,25 @@ class FreeScreenerBackend:
         m["dv_ttm"] = pd.to_numeric(df.get("dv_ttm"), errors="coerce")
         today = _dt.datetime.now().strftime("%Y%m%d")
         m["trade_date"] = df.get("trade_date", today)
-        m["industry"] = ""
-        m["area"] = ""
-        m["market"] = ""
-        m["list_date"] = ""
+        # 行业/地区/上市日期：本来源（zzshare 估值表）不含，单独补齐
+        try:
+            info = self._fetch_basic_info()          # 带磁盘缓存
+        except Exception:                            # noqa: BLE001
+            info = None
+        if info is not None and len(info):
+            keep = [c for c in ("ts_code", "industry", "area", "market", "list_date")
+                    if c in info.columns]
+            m = m.merge(info[keep], on="ts_code", how="left", suffixes=("", "_bi"))
+            for c in ("industry", "area", "market", "list_date"):
+                if c + "_bi" in m.columns:
+                    base = m[c] if c in m.columns else ""
+                    m[c] = m[c + "_bi"].where(
+                        m[c + "_bi"].notna() & (m[c + "_bi"].astype(str) != ""), base)
+                    m = m.drop(columns=[c + "_bi"])
+        for c in ("industry", "area", "market", "list_date"):
+            if c not in m.columns:
+                m[c] = ""
+            m[c] = m[c].fillna("").astype(str)
         # 股息率：优先用源数据（push2 的 f37），降级为 None
         m["dv_ttm"] = pd.to_numeric(df.get("dv_ttm"), errors="coerce")
         self._snapshot = m
@@ -131,6 +146,210 @@ class FreeScreenerBackend:
             except Exception:                         # noqa: BLE001
                 pass
         return m
+
+    def _zt_fin_ratios(self, ts_code: str) -> dict | None:
+        """取智兔财务主要指标（最新一期），返回 Tushare 风格键。
+
+        端点：/hs/fin/ratios/{code}.{SH|SZ|BJ}
+        字段（拼音缩写 -> 本项命名）：
+          zcfzl     资产负债率(%)   -> debt_to_assets
+          mlv       毛利率(%)      -> grossprofit_margin
+          jqjzcsyl  加权ROE(%)     -> roe_waa
+          jzcsyl    净资产收益率(%) -> roe
+          jlv       净利率(%)      -> netprofit_margin
+          jbmgsy    基本每股收益     -> eps
+          mgjzc     每股净资产
+
+        为何不批量：/hicw/cznl/{year}/4 虽一次拿 5000 只的 zcfzl，
+        但【银行返 None】（银行无此概念）；本接口能给出银行值（沪农商行 93.39），
+        且实测逐只 0.1s（200 只约 19s），可接受。结果带缓存。
+        """
+        if not ts_code:
+            return None
+        if ts_code in self._ratio_cache:
+            return self._ratio_cache[ts_code]
+        sym = str(ts_code).split(".")[0]
+        js = self._zt_get(f"/hs/fin/ratios/{ts_code}")
+        if not isinstance(js, list) or not js:
+            js = self._zt_get(f"/hs/fin/ratios/{sym}")
+        if not isinstance(js, list) or not js:
+            return None
+
+        def _num(v):
+            try:
+                f = float(v)
+                return f if f == f else None
+            except (TypeError, ValueError):
+                return None
+
+        # 按报告期降序，取最新一期有值的记录
+        recs = sorted(js, key=lambda r: str(r.get("jzrq") or ""), reverse=True)
+        # 优先取已完成年度（避开未完成年度）
+        cur_year = _dt.date.today().year
+        done = [r for r in recs
+                if str(r.get("jzrq") or "")[:4].isdigit()
+                and int(str(r["jzrq"])[:4]) < cur_year]
+        for r in (done or recs):
+            out = {
+                "debt_to_assets": _num(r.get("zcfzl")),
+                "grossprofit_margin": _num(r.get("mlv")),
+                "roe_waa": _num(r.get("jqjzcsyl")),
+                "roe": _num(r.get("jzcsyl")),
+                "netprofit_margin": _num(r.get("jlv")),
+                "eps": _num(r.get("jbmgsy")),
+                "bps": _num(r.get("mgjzc")),
+                "end_date": str(r.get("jzrq") or "").replace("-", ""),
+            }
+            if any(out[k] is not None for k in
+                   ("debt_to_assets", "grossprofit_margin", "roe_waa")):
+                self._ratio_cache[ts_code] = out
+                return out
+        return None
+
+    # -- 行业/上市日期补齐 ------------------------------------------------
+    # 行业：智兔「申万一级」—— /hs/index/tree 拿 31 个行业代码，
+    #       再对每个行业调 /hs/index/stock/{code} 取成分股。
+    #       实测 31 次请求覆盖 5520 只，全部正确（601825->银行 等）。
+    # 上市日期：交易所官网表（深/北/沪），3 次请求。
+    # 结果带磁盘缓存（30 天）。
+    _BI_TTL_DAYS = 30
+    _ratio_cache: dict = {}
+    ZT_BASE = "https://api.zhituapi.com"
+
+    def _zt_get(self, path: str, **params):
+        """调智兔 API（直连，不走代理；带重试）。"""
+        import requests
+        token = os.environ.get("ZHITU_TOKEN")
+        if not token:
+            return None
+        from rate_limit import make_session
+        sess = make_session(force_proxy=False)
+        sess.headers.update({"User-Agent": "Mozilla/5.0 Chrome/131"})
+        p = {"token": token}
+        p.update(params)
+        for attempt in range(3):
+            try:
+                r = sess.get(self.ZT_BASE + path, params=p, timeout=60)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:                          # noqa: BLE001
+                pass
+            time.sleep(2 * (attempt + 1))
+        return None
+
+    def _fetch_industry_zhitu(self, rows: dict) -> int:
+        """用智兔申万行业填 rows[ts_code]['industry']。返回填充条数。"""
+        tree = self._zt_get("/hs/index/tree")
+        if not isinstance(tree, list) or not tree:
+            return 0
+        inds = [t for t in tree
+                if str(t.get("name", "")).startswith("A股-申万行业-")
+                and t.get("code")]
+        filled = 0
+        for t in inds:
+            code = str(t.get("code"))
+            hy = str(t.get("name")).replace("A股-申万行业-", "")
+            arr = self._zt_get("/hs/index/stock/" + code)
+            if not isinstance(arr, list):
+                continue
+            for it in arr:
+                dm = str(it.get("dm") or "").strip()
+                if len(dm) != 6 or not dm.isdigit():
+                    continue
+                sfx = ".SH" if dm[0] in "69" else (".BJ" if dm[0] in "48" else ".SZ")
+                d = rows.setdefault(dm + sfx, {})
+                d["industry"] = hy
+                if it.get("mc"):
+                    d.setdefault("name", it["mc"])
+                filled += 1
+            time.sleep(0.15)
+        return filled
+
+    def _fetch_basic_info(self) -> pd.DataFrame | None:
+        """返回 ts_code / name / industry / area / market / list_date 映射表。
+
+        源（按顺序，全部不走 push2）：
+          1) 智兔 /hs/index/tree + /hs/index/stock/{code} -> 申万一级行业
+             （31 次请求，覆盖 5520 只）
+          2) stock_info_sz/bj/sh_name_code                -> 上市日期（3 次请求）
+        """
+        cache = self._get_cache()
+        if cache is not None:
+            try:
+                got = cache.get("basic_info_all", int(self._BI_TTL_DAYS * 86400))
+                if got is not None and len(got):
+                    return got
+            except Exception:                         # noqa: BLE001
+                pass
+
+        rows: dict[str, dict] = {}
+
+        def _put(code, **kw) -> None:
+            code = str(code or "").strip().zfill(6)
+            if len(code) != 6 or not code.isdigit():
+                return
+            sfx = ".SH" if code[0] in "69" else (".BJ" if code[0] in "48" else ".SZ")
+            d = rows.setdefault(code + sfx, {})
+            for k, v in kw.items():
+                if v not in (None, "") and str(v).lower() not in ("nan", "none", "-"):
+                    d[k] = v
+
+        def _norm_date(v) -> str:
+            t = str(v or "").strip()
+            if not t or t.lower() in ("nan", "none", "-"):
+                return ""
+            t = t.replace("/", "-")
+            if len(t) >= 10 and t[4] == "-":
+                return t[:10].replace("-", "")
+            return t[:8] if len(t) >= 8 else ""
+
+        # 1) 行业（智兔申万一级，全市场）
+        try:
+            self._fetch_industry_zhitu(rows)
+        except Exception:                              # noqa: BLE001
+            pass
+
+        # 2) 上市日期（交易所官网，与上面 merge 而非覆盖）
+        import akshare as ak
+        from rate_limit import throttle as _thr
+        try:
+            _thr("szse.cn")
+            for r in ak.stock_info_sz_name_code(symbol="A股列表").to_dict("records"):
+                _put(r.get("A股代码"), name=r.get("A股简称", ""),
+                     list_date=_norm_date(r.get("A股上市日期")))
+        except Exception:                              # noqa: BLE001
+            pass
+        try:
+            _thr("bse.cn")
+            for r in ak.stock_info_bj_name_code().to_dict("records"):
+                _put(r.get("证券代码"), name=r.get("证券简称", ""),
+                     list_date=_norm_date(r.get("上市日期")), area=r.get("地区", ""))
+        except Exception:                              # noqa: BLE001
+            pass
+        try:
+            _thr("sse.com.cn")
+            for sym in ("主板A股", "科创板"):
+                for r in ak.stock_info_sh_name_code(symbol=sym).to_dict("records"):
+                    _put(r.get("证券代码"), name=r.get("证券简称", ""),
+                         list_date=_norm_date(r.get("上市日期")))
+        except Exception:                              # noqa: BLE001
+            pass
+
+        if not rows:
+            return None
+        out = pd.DataFrame([
+            {"ts_code": k, **{f: v.get(f, "") for f in
+                               ("name", "industry", "area", "market", "list_date")}}
+            for k, v in rows.items()
+        ])
+        for c in ("name", "industry", "area", "market", "list_date"):
+            out[c] = out[c].fillna("").astype(str)
+        if cache is not None:
+            try:
+                cache.put("basic_info_all", out)
+            except Exception:                          # noqa: BLE001
+                pass
+        return out
 
     def _get_cache(self):
         """惰性创建磁盘缓存实例。"""

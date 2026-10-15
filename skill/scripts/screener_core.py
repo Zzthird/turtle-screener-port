@@ -326,12 +326,20 @@ class TushareScreener:
         df = df[mask].copy()
 
         # 1b. Exclude banks unless include_bank is True
+        #     行业名有两套体系，都要匹配：
+        #       - 申万一级（新浪 stock_classify_sina）："银行"
+        #       - 证监会门类（深交所/巨潮）："J 金融业" / "货币金融服务"
+        #     只写 "银行" 会漏掉后者。
         if not cfg.include_bank:
-            df = df[df["industry"] != "银行"].copy()
+            ind = df["industry"].fillna("").astype(str)
+            BANK_RE = r"银行|货币金融"
+            df = df[~ind.str.contains(BANK_RE, na=False, regex=True)].copy()
 
         # 2. Listing age >= min_listing_years
+        #    list_date 空值（源缺失）不拦截，避免因数据缺失误杀
         cutoff = (today - timedelta(days=cfg.min_listing_years * 365)).strftime("%Y%m%d")
-        df = df[df["list_date"] <= cutoff].copy()
+        ld = df["list_date"].fillna("").astype(str)
+        df = df[(ld == "") | (ld <= cutoff)].copy()
 
         # 3. Market cap >= min_market_cap_yi (total_mv is in 万元, convert to 亿: / 10000)
         df = df[df["total_mv"].notna()].copy()
@@ -454,6 +462,19 @@ class TushareScreener:
 
     # ---- Tier 2: Financial quality ----
 
+    def _industry_of(self, ts_code: str) -> str:
+        """取标的行业名（优先快照的申万行业；缺失则查智兔）。"""
+        try:
+            snap = self._backend.snapshot()
+            hit = snap[snap["ts_code"] == ts_code]
+            if len(hit):
+                ind = str(hit.iloc[0].get("industry") or "")
+                if ind:
+                    return ind
+        except Exception:                              # noqa: BLE001
+            pass
+        return ""
+
     def _check_financial_quality(self, ts_code: str, channel: str = "main"
                                  ) -> tuple[bool, dict[str, Any]]:
         """Check ROE, gross margin, debt ratio. For observation channel, also check profit_dedt.
@@ -491,6 +512,26 @@ class TushareScreener:
         debt = row.get("debt_to_assets")
         profit_dedt = row.get("profit_dedt")
 
+        # 免费源对部分股票（尤银行）给不出毛利率/资产负债率（值为 None），
+        # 且 grossprofit_margin 存在明显失真（实测茅台 365%、沪农商行
+        # 净利率 194%，而智兔分别为 91%/53%、49%）——只要出现 None
+        # 或 >100%（毛利率不可能超 100%）就用智兔 /hs/fin/ratios/ 覆盖：
+        #   zcfzl=资产负债率、mlv=毛利率、jqjzcsyl=加权ROE
+        _gm_bad = (gm is None) or (gm != gm) or (gm > 100) or (gm < -100)
+        _debt_bad = (debt is None) or (debt != debt)
+        if _gm_bad or _debt_bad:
+            try:
+                zt = self._backend._zt_fin_ratios(ts_code)
+                if zt:
+                    if _gm_bad and zt.get("grossprofit_margin") is not None:
+                        gm = zt["grossprofit_margin"]
+                    if _debt_bad and zt.get("debt_to_assets") is not None:
+                        debt = zt["debt_to_assets"]
+                    if (roe is None or roe != roe) and zt.get("roe_waa") is not None:
+                        roe = zt["roe_waa"]
+            except Exception:                          # noqa: BLE001
+                pass
+
         metrics["roe_waa"] = float(roe) if roe is not None and roe == roe else None
         metrics["gross_margin"] = float(gm) if gm is not None and gm == gm else None
         metrics["debt_to_assets"] = float(debt) if debt is not None and debt == debt else None
@@ -501,11 +542,19 @@ class TushareScreener:
             return self._check_obs_quality(ts_code, metrics, cfg)
 
         # Financial quality checks (main channel)
+        # 银行/非银金融为高杠杆行业（存款即负债），阈值按文档意图放宽
+        ind = self._industry_of(ts_code)
+        is_bank = any(k in ind for k in cfg.bank_industries)
+        max_debt = cfg.max_debt_ratio_bank if is_bank else cfg.max_debt_ratio
+        min_gm = cfg.min_gross_margin_bank if is_bank else cfg.min_gross_margin
+        metrics["industry"] = ind
+        metrics["is_bank"] = is_bank
+
         if metrics["roe_waa"] is not None and metrics["roe_waa"] < cfg.min_roe:
             return False, metrics
-        if metrics["gross_margin"] is not None and metrics["gross_margin"] < cfg.min_gross_margin:
+        if metrics["gross_margin"] is not None and metrics["gross_margin"] < min_gm:
             return False, metrics
-        if metrics["debt_to_assets"] is not None and metrics["debt_to_assets"] > cfg.max_debt_ratio:
+        if metrics["debt_to_assets"] is not None and metrics["debt_to_assets"] > max_debt:
             return False, metrics
 
         return True, metrics

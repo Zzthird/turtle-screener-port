@@ -50,7 +50,12 @@ class ScreenerConfig:
     min_turnover_pct: float = 0.1   # %
     max_pb: float = 10.0
     max_pe: float = 50.0
-    include_bank: bool = False  # 是否包含银行股
+    include_bank: bool = True  # 是否包含银行股（True=包含）
+    # 上游 notebook 设计意图：「对于银行等高杠杆行业，max_debt_ratio=70% 会自动放宽」
+    # 实际上免费源取不到银行的 grossprofit_margin / debt_to_assets（本就无意义），
+    # 值为 None → 质量门槛自动跳过 → 银行仅受 ROE 约束。故默认包含银行。
+    # 框架对银行的正确指标（NIM/不良率/拨备覆盖率）属定性分析职责，
+    # 见 shared/qualitative/references/industry_metrics_lookup.md，筛选器不计算。
 
     # --- Tier 1: Dual-channel PE ---
     obs_channel_limit: int = 50
@@ -68,6 +73,16 @@ class ScreenerConfig:
     min_roe: float = 8.0             # %
     min_gross_margin: float = 15.0   # %
     max_debt_ratio: float = 70.0     # %
+
+    # --- Tier 2: 银行/高杠杆行业专用门槛 ---
+    # 上游 notebook 的设计意图：「对于银行等高杠杆行业，max_debt_ratio=70%
+    # 会自动放宽」——但上游代码里并未实现。此处补上。
+    # 行业名单按【申万一级】名称匹配（智兔行业源），兼容旧口径「银行/金融」。
+    bank_industries: tuple = (
+        "银行", "非银金融", "货币金融", "金融业", "保险", "证券",
+    )
+    max_debt_ratio_bank: float = 96.0    # 银行/非银：存款即负债，90%+ 是常态
+    min_gross_margin_bank: float = 0.0   # 银行无「营业成本」概念，毛利率不适用
 
     # --- Tier 2: Observation channel quality (relaxed vs main) ---
     min_roe_obs: float = 0.0                # vs 8% for main channel
