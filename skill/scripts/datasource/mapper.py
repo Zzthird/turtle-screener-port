@@ -96,9 +96,10 @@ def map_record(
                 source=source, fetched_at=now, note="period-key",
             )
             continue
+
         if not src_key:
             values[spec.key] = Value(
-                None, unit=spec.unit, currency=currency, source=source,
+                None, unit=spec.unit, currency=currency, period=period, source=source,
                 fetched_at=now, note=f"{source} 无对应字段",
             )
             continue
@@ -123,6 +124,12 @@ def map_record(
             note=note,
             text=txt,
         )
+        # 保证 key_field 一定带 period（矩阵渲染依赖它）
+        if spec.key == dataset.key_field and period:
+            values[spec.key] = Value(
+                1.0, unit=spec.unit, currency=currency, period=period,
+                source=source, fetched_at=now, note="period-key",
+            )
 
     return Record(values=values, source=source)
 

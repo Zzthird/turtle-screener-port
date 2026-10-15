@@ -58,63 +58,147 @@ def collect_section(section: str, code: str, sources: list[str] | None = None) -
     return res, []
 
 
+def _fmt_num(v: float, unit: str = "") -> str:
+    """格式化数值。金额转百万元（框架统一口径）。"""
+    if v is None:
+        return "—"
+    if unit == "元":
+        v = v / 1e6                      # 元 -> 百万元
+    elif unit == "股":
+        v = v / 1e6                      # 股 -> 百万股
+    if abs(v) >= 1e6:
+        return f"{v:,.0f}"
+    if abs(v) >= 100:
+        return f"{v:,.2f}"
+    return f"{v:,.4f}".rstrip("0").rstrip(".") or "0"
+
+
 def _fmt_val(v: dict) -> str:
     """把 Value dict 格式化为表格单元格。"""
+    if not isinstance(v, dict):
+        return "—"
     txt = v.get("text")
     if txt:
         return str(txt)
     val = v.get("value")
     if val is None:
-        return "⚠️"
-    return f"{val:,.2f}" if abs(val) < 1e15 else str(val)
+        return "—"
+    return _fmt_num(val, v.get("unit", ""))
+
+
+def _period_label(v, r: dict | None = None) -> str:
+    """提取期间标签（如 20241231 -> 2024）。"""
+    p = ""
+    if isinstance(v, dict):
+        p = v.get("period") or v.get("text") or ""
+    p = str(p).replace("-", "").replace(" 00:00:00", "").strip()
+    if len(p) >= 8 and p[:8].isdigit():
+        return p[:4]
+    if len(p) == 4 and p.isdigit():
+        return p
+    return p[:10] or "?"
+
+
+def _row_period(r: dict) -> str:
+    """从一行记录推断期间。优先取任一字段的 period。"""
+    for key in ("报告期", "交易日期", "曲线日期", "公告日"):
+        if key in r:
+            p = _period_label(r[key])
+            if p and p != "?":
+                return p
+    for v in r.values():
+        if isinstance(v, dict) and v.get("period"):
+            p = _period_label(v)
+            if p and p != "?":
+                return p
+    return "?"
+
+
+# 矩阵型渲染（字段为行、期间为列）的数据集
+MATRIX_DATASETS = {"利润表", "资产负债表", "现金流量表", "财务指标"}
+
+
+def _render_matrix(res: SectionResult, rows: list[dict]) -> list[str]:
+    """字段为行、期间为列（与 Tushare 版 datapack 对齐）。"""
+    periods: list[str] = []
+    idx: dict[str, dict] = {}
+    for r in rows:
+        p = _row_period(r)
+        if p == "?":
+            continue
+        if p not in periods:
+            periods.append(p)
+        idx.setdefault(p, r)
+    if not periods:
+        return []
+
+    keys = [k for k in rows[0].keys()
+            if not k.startswith("_") and k not in ("报告期", "交易日期", "曲线日期")]
+
+    out = ["| 项目（百万元） | " + " | ".join(periods) + " |",
+           "|---|" + "---|" * len(periods)]
+    for k in keys:
+        cells = [_fmt_val(idx.get(p, {}).get(k, {})) for p in periods]
+        if all(c == "—" for c in cells):
+            continue                      # 全空的字段不输出
+        out.append(f"| {k} | " + " | ".join(cells) + " |")
+    out.append("")
+    return out
+
+
+def _render_keyvalue(res: SectionResult, rows: list[dict]) -> list[str]:
+    """键值表（如 §1 基本信息、§14 无风险利率）。"""
+    out = []
+    for r in rows:
+        for k, v in r.items():
+            if k.startswith("_"):
+                continue
+            cell = _fmt_val(v)
+            if cell == "—":
+                continue
+            out.append(f"| {k} | {cell} |")
+    if out:
+        out = ["| 项目 | 数值 |", "|---|---|"] + out[:40]
+    out.append("")
+    return out
 
 
 def section_markdown(section: str, res: SectionResult, rows: list[dict]) -> str:
-    """把一段结果渲染为 markdown（行为记录，字段为列）。"""
+    """把一段结果渲染为 markdown。"""
     lines = [f"## {title_for(section)}", ""]
 
     if not res.ok:
         tag = "⚠️ 降级" if res.degradable else "❌ 采集失败"
         lines += [f"> {tag}：{res.reason()}", ""]
-        if not rows:
-            lines += ["（本段数据不可用）", ""]
-            return "\n".join(lines)
+        lines += ["（本段数据不可用）", ""]
+        return "\n".join(lines)
 
     if not rows:
+        lines += ["（无数据）", ""]
         return "\n".join(lines)
 
     # 财务类只保留年报（12-31），避免混入季报
     def _is_annual(r: dict) -> bool:
-        for k in ("报告期", "交易日期", "曲线日期"):
-            v = r.get(k, {})
-            p = (v.get("text") if isinstance(v, dict) else None) or ""
-            if not p:
-                continue
-            p8 = str(p).replace("-", "")[:8]
-            if len(p8) >= 8:
-                return p8[4:8] == "1231"
-        return True
+        p = _row_period(r)
+        return True if p == "?" else p.isdigit()
 
-    if res.dataset in ("利潦表", "利润表", "资亱负债表", "现金流量表", "财务指标", "分红"):
+    if res.dataset in MATRIX_DATASETS | {"分红"}:
         annual = [r for r in rows if _is_annual(r)]
         if annual:
             rows = annual
         rows = rows[:8]          # 最多 8 年
+    elif res.dataset in ("周线行情", "无风险利率"):
+        rows = rows[:20]
     else:
         rows = rows[:60]
     res.rows = len(rows)
 
     lines += [f"> **数据来源**: `{res.source}` · {res.rows} 行", ""]
 
-    keys = [k for k in rows[0].keys() if not k.startswith("_")]
-    period_keys = [k for k in keys if k in ("报告期", "交易日期", "曲线日期", "公告日")]
-    keys = period_keys + [k for k in keys if k not in period_keys]
-
-    lines.append("| " + " | ".join(keys) + " |")
-    lines.append("|" + "---|" * len(keys))
-    for r in rows:
-        lines.append("| " + " | ".join(_fmt_val(r.get(k, {})) for k in keys) + " |")
-    lines.append("")
+    if res.dataset in MATRIX_DATASETS:
+        lines += _render_matrix(res, rows)
+    else:
+        lines += _render_keyvalue(res, rows)
     return "\n".join(lines)
 
 
