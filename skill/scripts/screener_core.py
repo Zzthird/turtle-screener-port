@@ -91,11 +91,23 @@ class TushareScreener:
 
     def __init__(self, token: str | None = None, config: ScreenerConfig | None = None):
         self.config = config or ScreenerConfig()
-        self._token = token or get_token()
-        self._pro = None  # lazy init
         self.cache = ScreenerCache(self.config.cache_dir)
         self._rf_cache: float | None = None  # global risk-free rate
         self._stock_data_cache: dict[str, pd.DataFrame] = {}  # per-stock in-memory cache
+        # 数据后端：有 token 走 Tushare，否则用免费源（AkShare/东财）
+        self._backend = None
+        self._token = token or os.environ.get("TUSHARE_TOKEN", "")
+        if not self._token:
+            try:
+                from config import get_token
+                self._token = get_token()
+            except Exception:                         # noqa: BLE001
+                self._token = ""
+        if not self._token:
+            from screener_backend import make_backend
+            self._backend = make_backend(verbose=os.environ.get("SCREENER_VERBOSE") == "1")
+            print("[screener] 未配置 TUSHARE_TOKEN -> 使用免费数据源")
+        self._pro = None  # lazy init
 
     def _get_pro(self):
         """Lazy-initialize Tushare pro API."""
@@ -109,7 +121,9 @@ class TushareScreener:
         return self._pro
 
     def _safe_call(self, api_name: str, **kwargs) -> pd.DataFrame:
-        """Call Tushare API with retry (mirrors TushareClient._safe_call)."""
+        """Call data API (Tushare or free backend)."""
+        if self._backend is not None:
+            return self._free_call(api_name, **kwargs)
         pro = self._get_pro()
         last_err = None
         try:
@@ -132,6 +146,34 @@ class TushareScreener:
                         self._pro._DataApi__http_url = api_url
                     time.sleep(1.0 * attempt)
         raise RuntimeError(f"Tushare API '{api_name}' failed after 3 retries: {last_err}")
+
+    def _free_call(self, api_name: str, **kwargs) -> pd.DataFrame:
+        """Tushare 接口名 -> 免费后端映射。"""
+        b = self._backend
+        ts_code = kwargs.get("ts_code")
+        if api_name == "stock_basic":
+            snap = b.snapshot()
+            cols = [c for c in ("ts_code", "name", "industry", "area", "market", "list_date")
+                    if c in snap.columns]
+            return snap[cols].copy()
+        if api_name == "daily_basic":
+            snap = b.snapshot()
+            keep = [c for c in ("ts_code", "trade_date", "close", "pe_ttm", "pb",
+                                "total_mv", "circ_mv", "dv_ttm", "turnover_rate")
+                    if c in snap.columns]
+            df = snap[keep].copy()
+            td = kwargs.get("trade_date")
+            if td is not None:
+                df["trade_date"] = td
+            return df
+        if api_name == "fina_indicator":
+            if ts_code:
+                return b.fina_indicator(ts_code)
+            return pd.DataFrame()
+        if api_name == "trade_cal":
+            return b.trade_cal(kwargs.get("start_date", ""), kwargs.get("end_date", ""))
+        # 未映射的接口：返回空表（调用方应能容忍）
+        return pd.DataFrame()
 
     def _cached_call(self, api_name: str, ts_code: str | None = None,
                      **kwargs) -> pd.DataFrame:

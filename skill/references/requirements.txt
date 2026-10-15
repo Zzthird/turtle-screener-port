@@ -11,3 +11,8 @@ ipykernel>=6.0.0
 jinja2>=3.0.0
 yfinance>=0.2.0
 markdown>=3.4.0
+# 缓存引擎（缺它会静默降级为无缓存 -> 重复拉取 -> 被限流）
+pyarrow>=10.0.0
+# 免费数据源
+akshare>=1.12.0
+zzshare>=0.4.0

@@ -45,15 +45,18 @@ class ScreenerCache:
             return None
 
     def put(self, key: str, df: pd.DataFrame) -> None:
-        """Store DataFrame to cache."""
+        """Store DataFrame to cache. 失败时告警（不静默）。"""
         path = self._path(key)
         meta_path = self._meta_path(key)
         try:
             df.to_parquet(path, index=False)
             with open(meta_path, "w") as f:
                 f.write(f"{time.time()}\n{key}")
-        except Exception:
-            pass  # cache write failure is non-fatal
+        except Exception as e:                        # noqa: BLE001
+            # 缓存写失败非致命，但必须可见（否则会造成重复拉取 -> 被限流）
+            import sys as _sys
+            print(f"[cache] 写入失败（key={key[:40]}）: {type(e).__name__}: {str(e)[:80]}",
+                  file=_sys.stderr)
 
     def invalidate(self, key: str) -> None:
         """Remove a cache entry."""
