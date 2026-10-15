@@ -14,6 +14,7 @@
 | 已装 pi skill | `~/.pi/agent/skills/turtle-analysis/` |
 | 已装 pi agents | `~/.pi/agent/agents/{quant,valuation,qualitative,auditor}.md` |
 | 数据源 | **AkShare + zzshare + 巨潮 PDF**（A股无需 Tushare token） |
+| 母公司报表覆盖 | **7/7**（含银行、无框线报表） |
 
 **核心设计**：Python 做确定性计算，LLM 只做判断与解释。
 **硬规则**：有 §17 网格时，Agent **禁止手算**，只许「查表选行 + 说明理由」。
@@ -112,7 +113,7 @@ D:\Codes\TurtlePi\
 
 ## 三、数据层（核心）
 
-### 设计
+### 数据层（核心）
 
 ```
 业务代码 → datasource.get() → Adapter → AkShare / zzshare / Tushare
@@ -124,6 +125,25 @@ D:\Codes\TurtlePi\
 1. **schema**：字段名用**中文业务语义**（不是 Tushare 英文名）+ 每个值带 `unit`/`currency`/`period` 元信息
 2. **mapper**：双向映射，支持运行期 override
 3. **adapters**：每个源一个适配器，异常包装 + 自动降级
+
+### §17 衍生指标网格（九个）
+
+| 子节 | 内容 |
+|---|---|
+| §17.1 | 财务趋势（CAGR/负债率/净现金） |
+| §17.2 | Factor2 输入（C/M/Rf/II/市值） |
+| **§17.3** | 真实现金收入（步骤3）：S − AR净增 − 预收净减 + 收款比率 |
+| **§17.4** | 经营性现金支出（步骤5）：W1供应商 + W2员工 + W3税款 + W4利息 |
+| **§17.5** | 真实可支配现金结余（步骤8）：输出 AA_2y / AA_all / AA_excl |
+| §17.6 | 价格分位（基于 §11 周线） |
+| **§17.8** | 绝对估值仪表盘：PE/PB/FCF收益率/商誉占比 |
+| **§17.9** | 业绩下滑敏感性：基准/-10%/-20%/-30% |
+| §17.10 | 支付率 M 三重校验 + Python 内裁定 M_rec |
+| §17.11 | 穿透回报率网格（AA变体×税率）+ 目标买入价 |
+| §17.12 | G 系数网格（0.7–1.8 × 12 档） |
+| §17.13 | λ 收入敏感性 + 临界收入倍数 |
+
+**§17.11 优先用 §17.5 的完整 11 步 AA**（不再回退 OCF−Capex 简化式）。
 
 ### 源优先级（按数据集配置）
 
@@ -242,17 +262,32 @@ pandas · tushare · pdfplumber · jinja2 · yfinance · tqdm · pytest · markd
 
 ---
 
-## 七、本项目特有的坑（务必先读）
+## 六、本项目特有的坑（务必先读）
 
-| # | 坑 | 详见 |
+| # | 坑 | 状态 |
 |---|---|---|
-| 1 | **AkShare「派息」是每 10 股派 X 元**（非每股） | 已修，见 data_collector `_aggregate_dividends` |
-| 2 | **财报比率不可累加**（毛利率/净利率是单季值，需均值） | 已修，见 akshare_adapter `_fetch_fina_indicator` |
-| 3 | **东财 `push2*.eastmoney.com` 被 IP 风控** | 已加降级，见 notes/datasource-others-test.md |
-| 4 | **巨潮 orgId 无法用公式推**（须查 API） | 已修，见 cninfo_downloader `resolve_org_id` |
-| 5 | **母公司报表仅年报 PDF 有**（免费源全无） | 见 notes/pdf-batch-verify.md，覆盖 5/7 |
-| 6 | **§1 基本信息**依赖三路径降级（东财→雪球→本地推导） | 已修，见 akshare_adapter `_fetch_stock_basic` |
-| 7 | **无框线 PDF 表格**需用 `text` 策略 | 见 pdf_parent_extractor `_extract_tables` |
+| 1 | **AkShare「派息」是每 10 股派 X 元**（非每股） | 已修 |
+| 2 | **财报比率不可累加**（毛利率/净利率是单季值，需均值） | 已修 |
+| 3 | **东财 `push2*.eastmoney.com` 被 IP 风控** | 已加降级 |
+| 4 | **巨潮 orgId 无法用公式推**（须查 API） | 已修 |
+| 5 | **母公司报表仅年报 PDF 有**（免费源全无） | 已解决，覆盖 7/7 |
+| 6 | **§1 基本信息**依赖三路径降级（东财→雪球→本地推导） | 已修 |
+| 7 | **无框线 PDF 表格**需用 `text` 策略 | 已修 |
+| 8 | **银行标题用「公司/本行」**而非「母公司」 | 已修 |
+| 9 | **PDF 表格把「附注」列当数值**（银行尤甚） | 已修（文本行解析） |
+| 10 | **银行报表页被误判为目录页** | 已修 |
+| 11 | **投资支付的现金含理财滚动**，不可全额扣除 | 已修（§17.5） |
+| 12 | **§17.13 与 §17.11 的 M 窗口不同**（近3年 vs 近5年） | 已知，以 §17.11 为唯一基准 |
+
+### 母公司报表（§3P/§4P）增强说明
+
+`pdf_parent_extractor.py` 支持：
+- **两种提取策略**：表格（lines/text）+ **文本行解析**（无框线/列合并）
+- **银行专用科目映射**（`BANK_ITEM_MAPS`，吸收存款/发放贷款/存放央行款项…）
+- **标题变体**：母公司 / 本行 / 公司
+- **跨页续接**：向后扫至多 4 页
+
+实测覆盖：一般工商企业 + 银行 + 无框线报表 = **7/7**
 
 ---
 
@@ -299,9 +334,12 @@ $OUT = "output\600887_伊利股份"
 ```
 §12 毛利率 33.01% / 净利率 8.20%      （CM§3 5年均值）
 CM§4 支付率 2024 = 91.29%             （官方 91.30%）
+§17.5 AA_2y = 19,816 / AA_all = 16,131
 §17.10 M_rec = 75.81%
-§17.11 GG = 6.20% (AA_2y★) / II = 3.70%
-§17.11 目标买入价 = 47.07 元
+§17.11 GG = 8.45% (AA_2y★) / II = 3.70%
+§17.11 目标买入价 = 64.17 元
+§17.8 FCF收益率 6.36% / PE 15.37x / 商誉占比 1.43%
+§17.9 -30% 情景仍达标（GG 6.16% > II 3.70%）
 最终裁决 = 观察
 ```
 
@@ -335,12 +373,26 @@ Copy-Item "D:\Codes\TurtlePi\prompts\*.md" "C:\Users\Administrator\.pi\agent\pro
 | `datasource-full-test.md` | 全量源实测 + 最终路由表 |
 | `datasource-others-test.md` | efinance/adata/mootdx 等排除依据 |
 | `datasource-verify.md` | zzshare/AkShare 数值验证 |
-| `pdf-batch-verify.md` | 7 股 PDF 提取批量验证（5/7） |
-| `e2e-verify.md` / `e2e-verify-2.md` | 端到端验证报告 |
-| `pi-upgrade.md` | pi 版本升级 + Junction 修复 |
-| `subagent-windows-fix.md` | subagent 三轮诊断对比 |
+| `pdf-batch-verify.md` | 7 股 PDF 提取批量验证 |
+| `e2e-verify.md` | 端到端验证报告 |
+| `pi-upgrade.md` | **pi 版本升级 + Junction 修复（含三轮诊断对比）** |
+| `subagent-windows-fix.md` | subagent 扩展源码修改记录 |
 | `path-audit.md` | 路径适配清单 |
+| `pi-version-before.txt` | 升级前版本快照（回滚参考） |
 
 ---
 
-*最后更新：端到端流程跑通（600887.SH 完整分析报告已产出）*
+## 十二、变更历史要点
+
+| 阶段 | 内容 |
+|---|---|
+| 数据层 | 3 适配器 + 逐段路由 + 多源对比 |
+| 采集器 | 17 段（16 数据 + §17 网格） |
+| PDF | 母公司报表 7/7（含银行 + 无框线） |
+| §17 | 9 个子节全部实现 |
+| 基础设施 | pi CLI 1.2.0 + Junction + pi-subagents |
+| 端到端 | 600887.SH 完整分析报告已产出（裁决：观察） |
+
+---
+
+*最后更新：§17 补齐 + 银行报表适配（母公司覆盖 7/7）*
