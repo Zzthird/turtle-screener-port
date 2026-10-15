@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 环境与密钥
+.env
+*.token
+
+# 输出与缓存
+output/*
+!output/.gitkeep
+.cache/
+*.log
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
