@@ -128,13 +128,28 @@ def collect_section(section: str, code: str, sources: list[str] | None = None) -
 
 
 def _fmt_num(v: float, unit: str = "") -> str:
-    """格式化数值。金额转百万元（框架统一口径）。"""
+    """格式化数值。
+
+    渲染规则：金额统一转为【百万元】（框架口径）。
+      元   -> ÷1e6
+      万元 -> ÷1e2
+      亿元 -> ×100
+    股   -> ÷1e6（百万股）
+    万股 -> ÷1e2
+    其他（元/股、万元、pct 等）原值。
+    """
     if v is None:
         return "—"
     if unit == "元":
-        v = v / 1e6                      # 元 -> 百万元
+        v = v / 1e6
+    elif unit == "万元":
+        v = v / 1e2
+    elif unit == "亿元":
+        v = v * 100
     elif unit == "股":
-        v = v / 1e6                      # 股 -> 百万股
+        v = v / 1e6
+    elif unit == "万股":
+        v = v / 1e2
     if abs(v) >= 1e6:
         return f"{v:,.0f}"
     if abs(v) >= 100:
@@ -237,14 +252,25 @@ def _render_list(res: SectionResult, rows: list[dict]) -> list[str]:
 
 
 def _render_keyvalue(res: SectionResult, rows: list[dict]) -> list[str]:
-    """键值表（如 §1 基本信息）。"""
+    """键值表（如 §1 基本信息）。
+
+    不做单位换算 —— 原样输出，与 Tushare 版 datapack 的 §1 一致
+    （下游 quality_control.py 按固定含义解析这些键名）。
+    """
     out = []
     for r in rows:
         for k, v in r.items():
             if k.startswith("_") or k == "报告期":
                 continue
-            cell = _fmt_val(v)
-            if cell == "—":
+            if not isinstance(v, dict):
+                continue
+            # 原值直出（不换算）
+            if v.get("text"):
+                cell = str(v["text"])
+            elif v.get("value") is not None:
+                x = v["value"]
+                cell = f"{x:,.2f}" if abs(x) < 1e6 else f"{x:,.0f}"
+            else:
                 continue
             out.append(f"| {k} | {cell} |")
     if out:

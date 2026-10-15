@@ -157,6 +157,8 @@ CASHFLOW_FIELDS: list[FieldSpec] = [
     FieldSpec("摊销_长期待摊", "元", "lt_amort_deferred_exp", True, "lt_amort_deferred_exp", "lt_amort_deferred_exp", None),
     FieldSpec("已付股息", "元", "c_pay_dist_dpcp_int_exp", True, "c_pay_dist_dpcp_int_exp", "cash_dividend_internal", "分配股利、利润或偿付利息所支付的现金"),
     FieldSpec("支付给职工现金", "元", "c_pay_to_staff", False, "c_pay_to_staff", None, "支付给职工以及为职工支付的现金"),
+    FieldSpec("投资活动现金流", "元", "n_cashflow_inv_act", False, "n_cashflow_inv_act", "NETCASH_INVEST", None),
+    FieldSpec("融资活动现金流", "元", "n_cash_flows_fnc_act", False, "n_cash_flows_fnc_act", "NETCASH_FINANCE", None),
 ]
 
 # ============ 财务指标 (fina_indicator) ============
@@ -211,6 +213,10 @@ DIVIDEND_FIELDS: list[FieldSpec] = [
 BASIC_FIELDS: list[FieldSpec] = [
     FieldSpec("代码",     "pct", "ts_code",   True, "ts_code"),
     FieldSpec("名称",     "pct", "name",      True, "name"),
+    FieldSpec("当前价格", "元/股", "close",    False, "close", None, "当前价格"),
+    FieldSpec("总市值",   "万元", "total_mv",  False, None, None, None),
+    FieldSpec("总市值 (万元)", "万元", "total_mv_wan", False, None, None, None),
+    FieldSpec("总股本",   "万股", "total_share", False, None, None, None),
     FieldSpec("行业",     "pct", "industry",  False, "industry"),
     FieldSpec("地区",     "pct", "area",      False, "area"),
     FieldSpec("上市日期", "pct", "list_date", False, "list_date"),
@@ -325,7 +331,9 @@ STRING_FIELDS: set[str] = {
     # 标识
     "代码", "名称", "行业", "地区", "市场",
     # 股东
-    "股东名", "股份类型", "增减",
+    "股东名", "股份类型", "增减", "名次",
+    # 基础信息
+    "上市日期", "市场",
     # 分红/回购
     "分红进度", "回购进度", "业务项目",
     # 审计

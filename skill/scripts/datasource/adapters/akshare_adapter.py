@@ -102,6 +102,15 @@ class AkshareAdapter(DataSource):
                 return dict(AF.PRICE_HIST_MAP)
             if "close" in keys:
                 return dict(AF.PRICE_hist_EN_MAP)
+
+        # 基础信息：适配器输出中文键名
+        if dataset_name == "股票基础信息":
+            return {
+                "代码": "ts_code", "当前价格": "当前价格",
+                "总市值": "总市值", "总市值 (万元)": "总市值 (万元)",
+                "总股本": "总股本",
+                "名称": "名称", "行业": "行业", "上市日期": "上市时间",
+            }
         return {}
 
     # -- 三大报表（新浪）------------------------------------------------
@@ -342,18 +351,62 @@ class AkshareAdapter(DataSource):
 
     # -- 基础信息 -------------------------------------------------------
     def _fetch_stock_basic(self, code, periods, limit, **kw) -> list[dict]:
-        """push2 被封，改用新浪/东财 datacenter 不依赖 push2 的入口。"""
+        """股票基础信息 + 估值快照。
+
+        push2.eastmoney.com 被 IP 风控，多路径降级：
+          1) stock_individual_info_em（东财，可能失败）
+          2) stock_individual_basic_info_xq（雪球）
+          3) 从行情+财报表本地拼凑（始终可用）
+        """
         ak = self._get_ak()
         num = _strip_prefix(code)
         out: dict = {"ts_code": code, "symbol": num}
-        try:
-            df = ak.stock_individual_basic_info_xq(symbol=_to_em(code))
-            for r in df.to_dict("records"):
-                out[r.get("item")] = r.get("value")
-        except Exception:                             # noqa: BLE001
-            pass
+
+        # 路径 1/2：个股信息接口
+        for fn, arg in [("stock_individual_info_em", {"symbol": num}),
+                        ("stock_individual_basic_info_xq", {"symbol": _to_em(code)})]:
+            f = getattr(ak, fn, None)
+            if f is None:
+                continue
+            try:
+                df = f(**arg)
+                if df is not None and len(df):
+                    for r in df.to_dict("records"):
+                        k = r.get("item") or r.get("key")
+                        v = r.get("value") or r.get("val")
+                        if k and v is not None:
+                            out[str(k)] = v
+                    if out.get("名称") or out.get("股票简称"):
+                        break
+            except Exception:                       # noqa: BLE001
+                continue
+
+        # 路径 3：本地拼凑（行情 + 财报表）
+        if not out.get("名称"):
+            try:
+                hist = ak.stock_zh_a_hist_tx(symbol=_to_sina(code), adjust="")
+                if hist is not None and len(hist):
+                    out["当前价格"] = float(hist.iloc[-1]["close"])
+                    out["trade_date"] = str(hist.iloc[-1]["date"]).replace("-", "")
+            except Exception:                       # noqa: BLE001
+                pass
+            # 总股本 / 市值（从资产负债表 + 收盘价）
+            try:
+                bs = ak.stock_financial_report_sina(stock=_to_sina(code), symbol="资产负债表")
+                if bs is not None and len(bs):
+                    col = "实收资本(或股本)"
+                    if col in bs.columns and bs.iloc[0][col] == bs.iloc[0][col]:
+                        shares = float(bs.iloc[0][col])           # 股
+                        out["总股本"] = shares / 1e4               # -> 万股
+                        if out.get("当前价格"):
+                            mv_yuan = out["当前价格"] * shares     # 元
+                            out["总市值"] = mv_yuan / 1e4          # -> 万元
+                            out["总市值 (万元)"] = mv_yuan / 1e4    # 兼容键名
+            except Exception:                       # noqa: BLE001
+                pass
+
         out["end_date"] = ""
-        return [out] if len(out) > 2 else []
+        return [out] if len(out) > 3 else []
 
     # -- 工具 -----------------------------------------------------------
     @staticmethod

@@ -90,8 +90,7 @@ CASHFLOW_EM_MAP = {
     "经营活动现金流":     "NETCASH_OPERATE",
     "资本开支":           "CONSTRUCT_LONG_ASSET",
     "投资活动现金流":     "NETCASH_INVEST",
-    "融资活动现金流":     "NETCASH_FINANCE",
-    "折旧摊销_固定资产":  "FA_IR_DEPR",
+    "融资活动现金流":     "NETCASH_FINANCE",    "折旧摊销_固定资产":  "FA_IR_DEPR",
     "摊销_无形资产":      "IA_AMORTIZE",
     "摊销_长期待摊":      "LPE_AMORTIZE",
     "已付股息":           "ASSIGN_DIVIDEND_PORFIT",
@@ -111,7 +110,6 @@ CASHFLOW_SINA_MAP = {
     "销售商品收到现金":   "销售商品、提供劳务收到的现金",
     "期末现金":           "期末现金及现金等价物余额",
 }
-
 # ============ 分红 (dividend) ============
 DIVIDEND_MAP = {
     "报告期":   "end_date",       # 适配器已用公告年推算
