@@ -31,9 +31,8 @@ class CninfoError(Exception):
 
 
 def _session():
-    import requests
-    s = requests.Session()
-    s.trust_env = False                     # 绕开失效的本地代理
+    from rate_limit import make_session
+    s = make_session()                      # 直连：国内财经站不走系统代理
     s.headers.update({
         "User-Agent": _UA,
         "Referer": "http://www.cninfo.com.cn/new/commonUrl?url=disclosure/list/notice",

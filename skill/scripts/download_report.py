@@ -143,6 +143,7 @@ def download_annual_report(url, save_path, max_retries=DEFAULT_MAX_RETRIES):
                 headers=get_headers(url),
                 timeout=DOWNLOAD_TIMEOUT,
                 stream=True,
+                proxies={"http": None, "https": None},   # 直连：不走系统代理
             )
             response.raise_for_status()
 

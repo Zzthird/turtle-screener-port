@@ -198,6 +198,32 @@ def backoff_call(
 
 
 # ---------------------------------------------------------------------------
+# 网络会话（统一禁用系统代理）
+# ---------------------------------------------------------------------------
+
+NO_PROXY_HOSTS = (
+    "eastmoney.com", "sinajs.cn", "sina.com.cn", "cninfo.com.cn",
+    "sse.com.cn", "szse.cn", "10jqka.com.cn", "xueqiu.com",
+)
+
+
+def make_session(disable_proxy: bool = True):
+    """创建 requests 会话。
+
+    ⚠️ 本项目所有国内财经站请求**必须直连**：
+       - 走代理（境外节点）→ 东财/新浪一律拒绝
+       - 直连            → 正常（除非本机 IP 临时被风控）
+    因此默认 trust_env=False，不读 HTTP_PROXY/HTTPS_PROXY。
+    """
+    import requests
+    s = requests.Session()
+    if disable_proxy:
+        s.trust_env = False
+        s.proxies = {"http": None, "https": None}
+    return s
+
+
+# ---------------------------------------------------------------------------
 # 简易状态报告
 # ---------------------------------------------------------------------------
 

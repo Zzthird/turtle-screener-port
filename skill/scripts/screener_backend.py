@@ -134,8 +134,8 @@ class FreeScreenerBackend:
                                 PAGE_INTERVAL)
 
         cd = DomainCooldown()
-        s = requests.Session()
-        s.trust_env = False
+        from rate_limit import make_session
+        s = make_session()          # 国内财经站直连（不走系统代理）
         s.headers.update({
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
