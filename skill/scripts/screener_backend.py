@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import time
 from typing import Optional
 
 import pandas as pd
@@ -108,15 +109,23 @@ class FreeScreenerBackend:
 
     @staticmethod
     def _to_ts(code: str) -> str:
+        """证券代码 -> Tushare 格式（带交易所后缀）。
+
+        东财代码规律：
+          6xxxxx/9xxxxx -> 沪   （北交所 920xxx 例外）
+          00/30/2xxxxx  -> 深
+          4xxxxx/8xxxxx -> 北交所
+          920xxx        -> 北交所（新代码段）
+        """
         c = str(code).strip()
         if "." in c:
             return c.upper()
+        if c.startswith("920") or c.startswith(("4", "8")):
+            return c + ".BJ"
         if c.startswith(("6", "9")):
             return c + ".SH"
         if c.startswith(("0", "2", "3")):
             return c + ".SZ"
-        if c.startswith(("4", "8")):
-            return c + ".BJ"
         return c
 
     def _fetch_em_push(self) -> Optional[pd.DataFrame]:
@@ -135,12 +144,9 @@ class FreeScreenerBackend:
 
         cd = DomainCooldown()
         from rate_limit import make_session
-        s = make_session()          # 国内财经站直连（不走系统代理）
-        s.headers.update({
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-            "Referer": "https://quote.eastmoney.com/",
-        })
+        from em_cookie import get_headers
+        s = make_session()          # 国内财经站直连
+        s.headers.update(get_headers(verbose=self.verbose))   # 含反爬 Cookie
         fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
         fields = "f12,f14,f2,f9,f23,f20,f21,f8"
 

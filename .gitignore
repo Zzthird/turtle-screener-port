@@ -22,3 +22,7 @@ output/*
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# 东财 Cookie（含会话令牌，不入库）
+output/.em_cache/
+

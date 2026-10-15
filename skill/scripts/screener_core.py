@@ -153,14 +153,20 @@ class TushareScreener:
         ts_code = kwargs.get("ts_code")
         if api_name == "stock_basic":
             snap = b.snapshot()
-            cols = [c for c in ("ts_code", "name", "industry", "area", "market", "list_date")
-                    if c in snap.columns]
+            # 确保 screener 需要的列都存在（缺失补空）
+            for c in ("ts_code", "name", "industry", "area", "market", "list_date"):
+                if c not in snap.columns:
+                    snap[c] = ""
+            cols = ["ts_code", "name", "industry", "area", "market", "list_date"]
             return snap[cols].copy()
         if api_name == "daily_basic":
             snap = b.snapshot()
-            keep = [c for c in ("ts_code", "trade_date", "close", "pe_ttm", "pb",
-                                "total_mv", "circ_mv", "dv_ttm", "turnover_rate")
-                    if c in snap.columns]
+            for c in ("ts_code", "trade_date", "close", "pe_ttm", "pb",
+                      "total_mv", "circ_mv", "dv_ttm", "turnover_rate"):
+                if c not in snap.columns:
+                    snap[c] = None
+            keep = ["ts_code", "trade_date", "close", "pe_ttm", "pb",
+                    "total_mv", "circ_mv", "dv_ttm", "turnover_rate"]
             df = snap[keep].copy()
             td = kwargs.get("trade_date")
             if td is not None:
