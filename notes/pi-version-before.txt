@@ -1,0 +1,19 @@
+pi 版本升级记录（升级前）
+========================
+日期：2026-10
+全局 CLI 版本: 0.85.1
+pi-web 内嵌:   1.2.0
+
+回滚命令:
+  npm i -g @earendil-works/pi-coding-agent@0.85.1
+
+已装 pi 包（~/.pi/agent/npm/node_modules）:
+  @earendil-works (Junction -> pi-web 的 1.2.0)
+  @js-temporal, @narumitw, acorn, grok-mermaid, highlight.js,
+  jiti, jsbi, pi-goal-x, pi-subagents, undici, yaml
+
+settings.json packages:
+  npm:pi-web-access, npm:pi-mcp-adapter, @narumitw/pi-btw,
+  @narumitw/pi-plan-mode, npm:pi-goal-x
+
+升级目标: 1.2.0（与 pi-web 对齐，修复 subagent 子 runner）
