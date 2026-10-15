@@ -285,7 +285,83 @@ Owner Earnings OE = C + D − D×G   （G 从 §17.12 网格选，D = 折旧摊�
 
 ---
 
-## 六、环境依赖（重要）
+## 六、选股器（Tier 1 全市场粗筛）
+
+**用途**：从全市场约 5200 只中筛出「低估值 + 高股息」候选池，再逐只跑深度分析。
+
+### 数据源（三源拼合，均免费）
+
+| 源 | 提供 | 获取方式 |
+|---|---|---|
+| **zzshare** | PE / PB / 市值 / 换手（5226 只，一次全市场） | 免 token |
+| **智兔** | 股息率（全市场，`/hitc/lsfh` 的 `pergx`） | `ZHITU_TOKEN`（项目 .env） |
+| AkShare | 名称（`stock_info_a_code_name`） | 免费 |
+
+### 使用
+
+```powershell
+$PY = "D:\Codes\TurtlePi\skill\.venv\Scripts\python.exe"
+cd D:\Codes\TurtlePi
+& $PY skill\scripts\screener_core.py --tier1-only --csv output\screen_t1.csv
+```
+
+**常用参数**：
+```powershell
+--tier1-only                     仅 Tier1（快）
+--min-roe 10 --max-pe 30 \
+--min-gross-margin 20            自定义阈值
+--cache-refresh                  强制刷新缓存
+--tier2-limit 50                 限 Tier2 数量
+```
+
+### 输出
+
+```
+output/screen_t1.csv
+列: ts_code, name, pe_ttm, pb, dv_ttm, total_mv, turnover_rate, tier1_score
+```
+
+### 筛选逻辑（Tier 1）
+
+```
+剔除 ST/PT/退市 → 市值 >= 5亿 → 换手 >= 0.1%
+  → PB 0~10 → PE 0~50 → 股息率 > 0
+  → 按 tier1_score 排序
+```
+
+### ⚠️ 重要：股息率和 PE 只是“粗筛”
+
+```
+股息率高 ≠ 值得买
+反例：一次性特别分红 / 周期顶部 / 借债分红
+
+真正的买入判断 → 对候选股跑 /turtle-analysis（GG vs II）
+```
+
+### 限流保护（已内置）
+
+| 参数（环境变量） | 默认 | 说明 |
+|---|---|---|
+| `RATE_LIMIT_MIN_INTERVAL` | 0.5s | 同域请求间隔 |
+| `RATE_LIMIT_PAGE_INTERVAL` | 0.35s | 分页间隔 |
+| `SCREENER_MAX_PAGES` | 30 | 分页上限（0=不限） |
+| `SCREENER_SNAPSHOT_TTL` | 21600 | 快照缓存（6h） |
+| `SCREENER_ENRICH_DV` | 1 | 是否补股息率 |
+
+**首次跑成功后快照会缓存 6h** —— 当天重复运行零请求。
+
+### 备选数据源（不推荐优先用）
+
+| 源 | 问题 |
+|---|---|
+| 东财 `push2delay` | 需 Cookie + 网络不稳（见 notes/eastmoney-push2.md） |
+| 新浪 `stock_zh_a_spot` | 只有价格，无 PE/PB |
+| 东财妙想 `stock-screen` | 需 apikey（待验证） |
+| 智兔 `/hs/public/realall` | 需付费版（免费版 429） |
+
+---
+
+## 七、环境依赖（重要）
 
 ### pi 环境
 
@@ -308,7 +384,7 @@ pandas · tushare · pdfplumber · jinja2 · yfinance · tqdm · pytest · markd
 
 ---
 
-## 六、本项目特有的坑（务必先读）
+## 八、本项目特有的坑（务必先读）
 
 | # | 坑 | 状态 |
 |---|---|---|
@@ -337,7 +413,7 @@ pandas · tushare · pdfplumber · jinja2 · yfinance · tqdm · pytest · markd
 
 ---
 
-## 八、注意事项
+## 九、注意事项
 
 ### 数据时效性
 
@@ -360,7 +436,7 @@ pandas · tushare · pdfplumber · jinja2 · yfinance · tqdm · pytest · markd
 
 ---
 
-## 九、验证与自检
+## 十、验证与自检
 
 ```powershell
 $PY = "D:\Codes\TurtlePi\skill\.venv\Scripts\python.exe"
@@ -391,7 +467,7 @@ CM§4 支付率 2024 = 91.29%             （官方 91.30%）
 
 ---
 
-## 十、修改后同步
+## 十一、修改后同步
 
 改动 `skill/` 后需同步到 pi：
 
@@ -414,7 +490,7 @@ Copy-Item "D:\Codes\TurtlePi\prompts\*.md" "C:\Users\Administrator\.pi\agent\pro
 
 ---
 
-## 十一、参考文档（notes/）
+## 十二、参考文档（notes/）
 
 | 文件 | 内容 |
 |---|---|
@@ -431,7 +507,7 @@ Copy-Item "D:\Codes\TurtlePi\prompts\*.md" "C:\Users\Administrator\.pi\agent\pro
 
 ---
 
-## 十二、变更历史要点
+## 十三、变更历史要点
 
 | 阶段 | 内容 |
 |---|---|
