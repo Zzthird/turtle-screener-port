@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""data_collector.py — 统一数据采集入口（替代 tushare_collector.py）。
+"""data_collector.py — 统一数据采集入口（多源路由）。
 
 按 router 的逐段路由表取数，每个源按优先级尝试，失败自动降级。
 输出 data_pack_market.md，每段标注实际来源。

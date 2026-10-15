@@ -25,7 +25,7 @@ description: 龟龟投资框架（Turtle Investment Framework）四因子基本�
 
 ## 数据采集（核心）
 
-**统一入口**：`scripts/data_collector.py`（替代 tushare_collector.py）
+**统一入口**：`scripts/data_collector.py`（多源路由，16 段）
 
 ```powershell
 # 采集全部 16 段（默认）
@@ -76,7 +76,7 @@ description: 龟龟投资框架（Turtle Investment Framework）四因子基本�
 
 ```
 Step A  市场数据刷新
-  .venv\Scripts\python.exe scripts\tushare_collector.py \
+  .venv\Scripts\python.exe scripts\data_collector.py \
      --code {ts_code} --output output/{code}_{company}/data_pack_market.md --refresh-market
 
 Phase 3.1  Agent B（quant）：Step 0 数据校验 + 11 步穿透回报率
@@ -135,10 +135,10 @@ Phase 3.2  Agent C（valuation）：估值 + 报告组装
 
 | 脚本 | 用途 |
 |---|---|
-| **`data_collector.py`** | **统一数据采集（推荐，16 段路由）** |
-| `cninfo_downloader.py` | 巨潮年报下载（港股/母公司报表用） |
+| **`data_collector.py`** | **统一数据采集（推荐，16 段路由，无需 token）** |
+| `cninfo_downloader.py` | 巨潮年报下载（母公司报表 §3P/§4P 用） |
 | `pdf_parent_extractor.py` | 母公司三表 PDF 提取（§3P/§4P） |
-| `tushare_collector.py` | 原 Tushare 采集（需 token，备用） |
+| `tushare_client.py` | Tushare 客户端（库，需 token；已被 data_collector 取代） |
 | `pdf_preprocessor.py` | 年报 PDF 7 章节提取 |
 | `quality_control.py` | 确定性预算指标 → `computed_metrics.md` |
 | `valuation_engine.py` | DCF/DDM/可比/Graham |

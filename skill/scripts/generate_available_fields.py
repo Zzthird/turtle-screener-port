@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate available_fields.json from TushareClient's endpoint field lists.
 
-Scans tushare_collector.py for all _safe_call invocations, extracts the
+Scans tushare_client.py for all _safe_call invocations, extracts the
 endpoint name and requested fields, and writes a summary JSON file.
 
 Usage:
@@ -17,7 +17,7 @@ import sys
 
 
 def extract_fields_from_source(source_path: str) -> dict:
-    """Parse tushare_collector.py to extract endpoint -> fields mappings."""
+    """Parse tushare_client.py to extract endpoint -> fields mappings."""
     with open(source_path, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -42,9 +42,9 @@ def main():
                         help="Output JSON path (default: output/available_fields.json)")
     args = parser.parse_args()
 
-    # Find tushare_collector.py relative to this script
+    # Find tushare_client.py relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    source_path = os.path.join(script_dir, "tushare_collector.py")
+    source_path = os.path.join(script_dir, "tushare_client.py")
 
     if not os.path.exists(source_path):
         print(f"Error: {source_path} not found", file=sys.stderr)

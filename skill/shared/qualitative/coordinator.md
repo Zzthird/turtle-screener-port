@@ -88,7 +88,7 @@ bash init.sh   # 创建 .venv 并安装依赖（pandas / tushare / pdfplumber �
 
 ```bash
 mkdir -p {output_dir}
-python3 scripts/tushare_collector.py --code {ts_code} --output {output_dir}/data_pack_market.md
+python3 scripts/data_collector.py --code {ts_code} --output {output_dir}/data_pack_market.md
 ```
 
 ### 1A2：确定性预算指标（杠杆1，1A 完成后串行，<5s）
@@ -367,7 +367,7 @@ python3 scripts/report_to_html.py \
 │   │   └── writing_style.md           ← 指针 → references/writing_style_rules.md
 │   └── references/                    ← 参考文件（含 writing_style_rules / industry_metrics_lookup）
 ├── scripts/
-│   ├── tushare_collector.py           ← Tushare 采集
+│   ├── data_collector.py              ← 多源采集
 │   ├── quality_control.py             ← CM 预算（Step 1A2）
 │   ├── report_consistency.py          ← 跨段一致性 + 硬门槛（Step 3A）
 │   └── report_to_html.py             ← MD→HTML

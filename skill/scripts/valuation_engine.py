@@ -1492,7 +1492,7 @@ def main():
     token = get_token()
 
     # Import TushareClient here to keep module importable without tushare for testing
-    from tushare_collector import TushareClient
+    from tushare_client import TushareClient
 
     print(f"[valuation_engine] 正在采集 {ts_code} 数据...", file=sys.stderr)
     client = TushareClient(token)

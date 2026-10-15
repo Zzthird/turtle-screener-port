@@ -33,7 +33,7 @@ _TushareClient = None
 def _get_tushare_client_class():
     global _TushareClient
     if _TushareClient is None:
-        from tushare_collector import TushareClient
+        from tushare_client import TushareClient
         _TushareClient = TushareClient
     return _TushareClient
 

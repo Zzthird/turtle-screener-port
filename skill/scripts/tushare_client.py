@@ -1,16 +1,14 @@
-#!/usr/bin/env python3
-"""Turtle Investment Framework - Tushare Data Collector (Phase 1A).
+"""Tushare 数据客户端（库）。
 
-Facade module: re-exports all public names and defines TushareClient
-which inherits from mixin classes in tushare_modules/.
+CLI 职责已废弃 —— 数据采集请用 scripts/data_collector.py
+（多源路由 AkShare/zzshare/巨潮PDF/Tushare，无需 token）。
 
-Collects 5 years of financial data from Tushare Pro API and outputs
-a structured data_pack_market.md file.
+本模块作为库被内部脚本使用：
 
-Usage:
-    python scripts/tushare_collector.py --code 600887.SH
-    python scripts/tushare_collector.py --code 600887.SH --output output/data_pack.md
-    python scripts/tushare_collector.py --code 600887.SH --dry-run
+    screener_core.py / valuation_engine.py   ->  TushareClient
+    tushare_modules/*.py                     ->  sys.modules["tushare_collector"].yf
+
+文末在 sys.modules 注册 tushare_collector 别名，以兼容既有 @patch 用法。
 """
 
 import argparse
@@ -282,144 +280,8 @@ class TushareClient(
         return df
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Collect financial data from Tushare Pro API",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s --code 600887.SH
-  %(prog)s --code 600887 --output output/data_pack_market.md
-  %(prog)s --code 00700.HK --extra-fields balancesheet.defer_tax_assets
-  %(prog)s --code 600887.SH --cache-refresh   # 财报季（4/8/10月）建议刷新
-
-Note: 财报接口结果会缓存 7 天（行情/利率 24 小时）。财报季（4/8/10 月）
-建议加 --cache-refresh 以获取最新披露的财报数据。
-        """,
-    )
-    parser.add_argument(
-        "--code",
-        required=True,
-        help="Stock code (e.g., 600887.SH, 000858.SZ, 00700.HK, or plain digits)",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        help="Tushare API token (defaults to TUSHARE_TOKEN env var)",
-    )
-    parser.add_argument(
-        "--output",
-        default="output/data_pack_market.md",
-        help="Output file path (default: output/data_pack_market.md)",
-    )
-    parser.add_argument(
-        "--extra-fields",
-        nargs="*",
-        help="Additional fields to fetch (format: endpoint.field_name)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print parsed arguments and exit without calling API",
-    )
-    parser.add_argument(
-        "--refresh-market",
-        action="store_true",
-        help="Only refresh market-sensitive sections (§1/§2/§11/§14) in existing data pack",
-    )
-    parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="Disable the TTL disk cache for financial endpoints (always fetch live)",
-    )
-    parser.add_argument(
-        "--cache-refresh",
-        action="store_true",
-        help="Invalidate this stock's cached financial data before collecting "
-             "(recommended during earnings season: 4/8/10 月)",
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    # Validate and normalize stock code
-    try:
-        ts_code = validate_stock_code(args.code)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    if args.dry_run:
-        print("=== Dry Run ===")
-        print(f"  Stock code: {args.code} -> {ts_code}")
-        print(f"  Token: {'provided via --token' if args.token else 'from TUSHARE_TOKEN env'}")
-        print(f"  Output: {args.output}")
-        print(f"  Extra fields: {args.extra_fields or 'none'}")
-        return
-
-    # Get token
-    token = args.token or get_token()
-    client = TushareClient(token)
-
-    # TTL cache controls
-    if args.no_cache:
-        client._cache_enabled = False
-    if args.cache_refresh:
-        client._get_ttl_cache().invalidate_prefix(f"collector_{ts_code}_")
-        print(f"Cache invalidated for {ts_code}")
-
-    if args.refresh_market:
-        from pathlib import Path
-        output_path = Path(args.output)
-        if not output_path.exists():
-            print(f"⚠️ {output_path} does not exist, falling back to full collection")
-            print(f"Collecting data for {ts_code}...")
-            data_pack = client.assemble_data_pack(ts_code)
-        else:
-            existing = output_path.read_text(encoding="utf-8")
-            age_days = client._check_staleness(existing)
-            if age_days > 7:
-                print(f"⚠️ Data pack is {age_days} days old, falling back to full collection")
-                print(f"Collecting data for {ts_code}...")
-                data_pack = client.assemble_data_pack(ts_code)
-            else:
-                print(f"Refreshing market data for {ts_code} (data pack is {age_days} day(s) old)...")
-                data_pack = client.refresh_market_sections(ts_code, existing)
-    else:
-        print(f"Collecting data for {ts_code}...")
-        data_pack = client.assemble_data_pack(ts_code)
-
-    # Handle extra fields
-    if args.extra_fields:
-        extra_lines = ["\n", format_header(2, "附加字段"), ""]
-        for field_spec in args.extra_fields:
-            parts = field_spec.split(".", 1)
-            if len(parts) != 2:
-                extra_lines.append(f"- 无效字段格式: {field_spec} (应为 endpoint.field_name)")
-                continue
-            endpoint, field_name = parts
-            try:
-                df = client._safe_call(endpoint, ts_code=ts_code, fields=f"ts_code,end_date,{field_name}")
-                if not df.empty:
-                    extra_lines.append(f"**{endpoint}.{field_name}**:")
-                    extra_lines.append(df.to_markdown(index=False))
-                    extra_lines.append("")
-                else:
-                    extra_lines.append(f"- {endpoint}.{field_name}: 无数据")
-            except Exception as e:
-                extra_lines.append(f"- {endpoint}.{field_name}: 获取失败 ({e})")
-        data_pack += "\n".join(extra_lines)
-
-    # Write output
-    import os
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.write(data_pack)
-    print(f"Output written to {args.output}")
-    print(f"File size: {os.path.getsize(args.output):,} bytes")
-
-
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# 向后兼容：注册 tushare_collector 别名
+# ---------------------------------------------------------------------------
+_self = sys.modules[__name__]
+sys.modules.setdefault("tushare_collector", _self)

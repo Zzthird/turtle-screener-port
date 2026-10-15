@@ -138,7 +138,7 @@ bash init.sh   # 创建 .venv 并安装依赖（pandas / tushare / pdfplumber �
 # 超过 7 天自动降级为全量采集
 
 Bash(
-  command = "python3 scripts/tushare_collector.py --code {ts_code} --output {output_dir}/data_pack_market.md --refresh-market",
+  command = "python3 scripts/data_collector.py --code {ts_code} --output {output_dir}/data_pack_market.md --refresh-market",
   description = "StepA 市场数据刷新"
 )
 ```
@@ -291,7 +291,7 @@ Task(
 │       ├── factor_interface.md                 ← 因子间参数传递 schema
 │       └── judgment_examples_turtle.md         ← G系数/分配意愿/λ锚点（龟龟专属）
 ├── scripts/                                    ← 预处理脚本（只读）
-│   ├── tushare_collector.py                    ← 数据采集脚本（支持 --refresh-market）
+│   ├── data_collector.py                       ← 多源采集（16 段路由）
 │   ├── pdf_preprocessor.py                     ← PDF 预处理脚本（BA 扫描件 fallback 用）
 │   ├── config.py                               ← Token 管理
 │   └── requirements.txt                        ← Python 依赖
