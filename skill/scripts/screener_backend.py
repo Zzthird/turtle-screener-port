@@ -554,6 +554,45 @@ class FreeScreenerBackend:
         "曲线日期": "trade_date",
     }
 
+    # -- 总股本 -------------------------------------------------------
+    _share_cache: dict = {}
+
+    def _get_total_share_wan(self, ts_code: str):
+        """取总股本（万股）。
+
+        直调东财 push2 `api/qt/stock/get`，字段 f84 = 总股本（股）。
+        不走 akshare（其内部自建 session，不会读我们的代理/限流配置）。
+
+        注意：push2 域名受项目探测纪律约束（间隔 >=5s、失败不重试），
+        所以这里只试一次，失败就返回 None 由上层降级。
+        """
+        if not ts_code:
+            return None
+        if ts_code in self._share_cache:
+            return self._share_cache[ts_code]
+        sym = str(ts_code).split(".")[0]
+        market = 1 if sym.startswith(("6", "9")) else 0
+        try:
+            from rate_limit import make_session
+            s = make_session(force_proxy=True)
+            r = s.get(
+                "https://push2.eastmoney.com/api/qt/stock/get",
+                params={"fltt": "2", "invt": "2", "fields": "f84,f116,f85",
+                        "secid": f"{market}.{sym}"},
+                timeout=10,
+            )
+            js = r.json() or {}
+            raw = (js.get("data") or {}).get("f84")
+            if raw in (None, "-"):
+                return None
+            val = float(raw) / 1e4          # 股 -> 万股
+            if val > 0:
+                self._share_cache[ts_code] = val
+                return val
+        except Exception:                   # noqa: BLE001
+            pass
+        return None
+
     def dataset_call(self, api_name: str, code: str = None, **kwargs) -> pd.DataFrame:
         """通用取数：把数据层的 Result 转成 Tushare 风格的 DataFrame。
 
@@ -578,19 +617,24 @@ class FreeScreenerBackend:
         rev = {v: k for k, v in self._FIELD_ALIAS.items()}
         cur_year = _dt.date.today().year
         rows = []
-        # 总股本（万股）——分红表无此列，从快照补
+        # 总股本（万股）——分红表无此列，默认从快照推导（市值/价格）。
+        # 东财 push2 直取（_get_total_share_wan）精度与推导法一致，
+        # 但依赖不稳定的 push2，故仅在 USE_PUSH2_SHARE=1 时启用。
         base_share = None
         if api_name == "dividend":
-            try:
-                snap = self.snapshot()
-                hit = snap[snap["ts_code"] == (code or kwargs.get("ts_code"))]
-                if len(hit):
-                    mv = float(hit.iloc[0]["total_mv"])      # 万元
-                    cl = float(hit.iloc[0]["close"])         # 元
-                    if cl and cl == cl:
-                        base_share = mv / cl                 # 万股
-            except Exception:                         # noqa: BLE001
-                pass
+            if os.environ.get("USE_PUSH2_SHARE") == "1":
+                base_share = self._get_total_share_wan(code or kwargs.get("ts_code"))
+            if not base_share:
+                try:
+                    snap = self.snapshot()
+                    hit = snap[snap["ts_code"] == (code or kwargs.get("ts_code"))]
+                    if len(hit):
+                        mv = float(hit.iloc[0]["total_mv"])      # 万元
+                        cl = float(hit.iloc[0]["close"])         # 元
+                        if cl and cl == cl:
+                            base_share = mv / cl                 # 万股
+                except Exception:                         # noqa: BLE001
+                    pass
 
         for rec in r:
             row = {}
