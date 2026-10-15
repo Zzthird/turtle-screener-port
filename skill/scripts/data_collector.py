@@ -32,6 +32,13 @@ from datasource.router import (                                      # noqa: E40
     SectionResult, dataset_for, is_degradable, sources_for, title_for,
 )
 
+# §13 风险检测的必需字段（用于缺失检测）
+REQUIRED_FIELDS: dict[str, list[str]] = {
+    "利润表": ["营业收入", "归母净利润"],
+    "现金流量表": ["经营活动现金流"],
+    "资产负债表": ["总资产", "总负债"],
+}
+
 
 def collect_section(section: str, code: str, sources: list[str] | None = None) -> tuple[SectionResult, list[dict]]:
     """取一个数据段，按优先级尝试各源。"""
@@ -146,12 +153,31 @@ def _render_matrix(res: SectionResult, rows: list[dict]) -> list[str]:
     return out
 
 
+# 列表型数据集（每行一个实体，如股东/业务分部）
+LIST_DATASETS = {"十大股东", "主营业务构成", "分红", "股份回购", "股权质押",
+                 "日线行情", "周线行情", "无风险利率"}
+
+
+def _render_list(res: SectionResult, rows: list[dict]) -> list[str]:
+    """每行一个记录，字段为列。"""
+    keys = [k for k in rows[0].keys() if not k.startswith("_") and k != "报告期"]
+    priority = ["股东名", "业务项目", "公告日", "公告日期", "回购进度", "质押比例",
+                "交易日期", "曲线日期", "每股股息", "分红进度"]
+    keys = [k for k in priority if k in keys] + [k for k in keys if k not in priority]
+
+    out = ["| " + " | ".join(keys) + " |", "|" + "---|" * len(keys)]
+    for r in rows:
+        out.append("| " + " | ".join(_fmt_val(r.get(k, {})) for k in keys) + " |")
+    out.append("")
+    return out
+
+
 def _render_keyvalue(res: SectionResult, rows: list[dict]) -> list[str]:
-    """键值表（如 §1 基本信息、§14 无风险利率）。"""
+    """键值表（如 §1 基本信息）。"""
     out = []
     for r in rows:
         for k, v in r.items():
-            if k.startswith("_"):
+            if k.startswith("_") or k == "报告期":
                 continue
             cell = _fmt_val(v)
             if cell == "—":
@@ -187,7 +213,7 @@ def section_markdown(section: str, res: SectionResult, rows: list[dict]) -> str:
         if annual:
             rows = annual
         rows = rows[:8]          # 最多 8 年
-    elif res.dataset in ("周线行情", "无风险利率"):
+    elif res.dataset in ("周线行情", "无风险利率", "分红"):
         rows = rows[:20]
     else:
         rows = rows[:60]
@@ -197,6 +223,8 @@ def section_markdown(section: str, res: SectionResult, rows: list[dict]) -> str:
 
     if res.dataset in MATRIX_DATASETS:
         lines += _render_matrix(res, rows)
+    elif res.dataset in LIST_DATASETS:
+        lines += _render_list(res, rows)
     else:
         lines += _render_keyvalue(res, rows)
     return "\n".join(lines)
@@ -253,20 +281,40 @@ def main() -> int:
     code = args.code
     limit_sources = [s.strip() for s in args.sources.split(",")] if args.sources else None
     sections = ([s.strip() for s in args.sections.split(",")] if args.sections
-                else ["1", "2", "3", "3P", "4", "4P", "5", "6", "11", "12", "14", "15", "16"])
+                else ["1", "2", "3", "3P", "4", "4P", "5", "6", "7", "9", "11", "12", "13", "14", "15", "16"])
 
     print(f"采集 {code} — {len(sections)} 段")
     print(f"可用源: {list_sources(only_available=True)}")
 
     results: list[SectionResult] = []
     parts: list[str] = []
+    raw_sections: dict[str, list[dict]] = {}
+    pending_13 = False
+
+    # 数据段先采集（§13 依赖前面的结果）
     for sec in sections:
+        if sec == "13":
+            pending_13 = True
+            continue
         res, rows = collect_section(sec, code, limit_sources)
         results.append(res)
         print(f"  §{sec:<4} {res.dataset:<12} {res.status}")
         if res.reason() and not res.ok:
             print(f"         ↳ {res.reason()}")
+        if rows and res.dataset not in ("-", None):
+            raw_sections.setdefault(res.dataset, rows)
         parts.append(section_markdown(sec, res, rows))
+
+    # §13 本地风险检测（基于已采集数据）
+    if pending_13:
+        from datasource import risk_check
+        body = risk_check.render(raw_sections, REQUIRED_FIELDS)
+        parts.append(f"## {title_for('13')}\n\n{body}")
+        n_items = body.count("\n- ") + body.count("\n- ")
+        res13 = SectionResult(section="13", dataset="风险检测", ok=True,
+                              source="local", rows=len(raw_sections))
+        results.append(res13)
+        print(f"  §13  风险检测       ✅ local（扫 {len(raw_sections)} 个数据集）")
 
     doc = build_header(code, results) + "\n".join(parts) + build_summary(results)
 

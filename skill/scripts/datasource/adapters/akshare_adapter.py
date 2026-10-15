@@ -277,6 +277,35 @@ class AkshareAdapter(DataSource):
 
         return [out] if (close is not None or shares) else []
 
+    # -- 主营业务构成 ---------------------------------------------------
+    def _fetch_fina_mainbz(self, code, periods, limit, **kw) -> list[dict]:
+        """AkShare stock_zygc_em —— 主营构成（按产品/地区分类）。
+
+        列: 股票代码 报告日期 分类类型 主营构成 主营收入 收入比例
+            主营成本 成本比例 主营利润 利润比例 毛利率
+        """
+        ak = self._get_ak()
+        try:
+            df = ak.stock_zygc_em(symbol=_to_em(code))
+        except Exception as e:                        # noqa: BLE001
+            raise DataSourceError(f"akshare 主营构成失败：{str(e)[:150]}") from e
+        if df is None or len(df) == 0:
+            return []
+
+        rows = df.to_dict("records")
+        # 只取最新年报期、按产品分类
+        years = sorted({str(r.get("报告日期", ""))[:4] for r in rows if r.get("报告日期")},
+                       reverse=True)
+        target = years[0] if years else None
+        picked = [r for r in rows
+                  if str(r.get("报告日期", ""))[:4] == target
+                  and r.get("分类类型") == "按产品分类"]
+        if not picked:
+            picked = [r for r in rows if str(r.get("报告日期", ""))[:4] == target]
+        for r in picked:
+            r["end_date"] = target or ""
+        return picked[:limit]
+
     # -- 行情（日线 / 周线）--------------------------------------------
     def _fetch_daily(self, code, periods, limit, **kw) -> list[dict]:
         return self._hist(code, "daily", limit)
