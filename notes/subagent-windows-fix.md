@@ -1,75 +1,92 @@
-# pi subagent 扩展 Windows 兼容性问题
+# pi subagent 扩展 Windows 修复（第 2 轮）
 
-日期：2026-10 | 状态：**已修复**
+日期：2026-10 | 状态：**已修复并验证**
 
 ---
 
-## 问题现象
+## 问题演进
+
+### 第 1 轮（错误诊断）
 
 ```
-Agent failed: error: option '-p, --port <port>' argument '--no-session' is invalid.
-'--no-session' is not a non-negative number.
+Agent failed: option '-p, --port <port>' argument '--no-session' is invalid
 ```
 
-## 根因
+**我的初判**：`command: "pi"` 被 Node spawn 解析到 `pi.ps1`，参数错乱。
 
-`~/.pi/agent/extensions/subagent/index.ts` 的 `getPiInvocation()`：
+**尝试的修复**：改用 `pi.cmd` 绝对路径 + `shell: false`。
+
+### 第 2 轮（真正根因）
+
+验证时发现 `.cmd` + `shell:false` 直接报错：
+
+```
+Error: spawn EINVAL
+    at ChildProcess.spawn (node:internal/child_process:420:11)
+```
+
+**真正根因**：**Node.js 18.20+ / 20+ 的安全加固** ——
+`spawn()` 对 `.cmd` / `.bat` 文件**要求 `shell: true`**，否则抛 `EINVAL`。
+而在 `shell: false` 下回退到 `command: "pi"`，又会命中 PowerShell shim（`pi.ps1`），
+参数被 shim 误解析 → 出现 `--port` 的假报错。
+
+---
+
+## 正确修复
 
 ```typescript
-const execName = path.basename(process.execPath).toLowerCase();
-const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-if (!isGenericRuntime) return { command: process.execPath, args };
-return { command: "pi", args };          // ← 问题
-```
+function getPiInvocation(args: string[]): { command: string; args: string[] } {
+    // ... 前面的 execPath 逻辑不变 ...
 
-**Windows 下 `command: "pi"` 会被 Node spawn 解析到 `pi.ps1`**。
-但 Node 的 `spawn(cmd, args, {shell: false})` **无法执行 `.ps1`**，
-参数被 PowerShell shim 误解析，`-p` 撞上了某个 CLI 的 `--port` 选项。
-
-**验证**：
-```
-# 直接跑（正常）
-pi --mode json -p --no-session "test"          ✅
-
-# 用 pi.cmd（正常）
-%APPDATA%\npm\pi.cmd --mode json -p --no-session "test"   ✅
-```
-
-## 修复
-
-改 `getPiInvocation()`：Windows 下**优先解析 `pi.cmd`**，找不到才回退到 shell。
-
-```typescript
-if (process.platform === "win32") {
-    const dir = path.dirname(process.execPath);
-    const candidates = [
-        path.join(dir, "pi.cmd"),
-        path.join(dir, "node_modules", "@agegr", "pi-web", "pi.cmd"),
-        path.join(process.env.APPDATA || "", "npm", "pi.cmd"),
-    ];
-    for (const c of candidates) {
-        if (c && fs.existsSync(c)) return { command: c, args };
+    // Windows: Node 18.20+/20+ 的 spawn 对 .cmd/.bat 要求 shell:true（否则 EINVAL）
+    // 且直接执行 .ps1 会失败，因此统一用 shell + pi 命令名。
+    if (process.platform === "win32") {
+        return { command: "pi", args, shell: true };
     }
-    return { command: "pi", args, shell: true };   // 最终回退
+    return { command: "pi", args };
 }
 ```
 
-同时 `spawn()` 的 `shell: false` 改为跟随 invocation 的 `shell` 标记。
+同时 `spawn()` 的 shell 标记跟随 invocation：
 
-## 影响范围
+```typescript
+const proc = spawn(invocation.command, invocation.args, {
+    cwd: cwd ?? defaultCwd,
+    shell: (invocation as { shell?: boolean }).shell === true,
+    stdio: ["ignore", "pipe", "pipe"],
+});
+```
+
+---
+
+## 验证
+
+```javascript
+// 独立 Node 脚本测试（shell: true）
+spawn("pi", ["--mode","json","-p","--no-session","say hi"], { shell: true })
+// -> exit: 0 ✅
+// -> {"type":"session",...} {"type":"agent_start"} ...
+```
+
+---
+
+## 关键理解
 
 | 项 | 说明 |
 |---|---|
-| 影响 | 所有通过 subagent 扩展调用的 agent（本项目的 quant/valuation/qualitative/auditor） |
-| 平台 | **仅 Windows**（macOS/Linux 不受影响，`pi` 是可执行文件） |
-| 性质 | 扩展自身的跨平台缺陷，**非本项目问题** |
+| `shell: false` + `.cmd` | ❌ Node 18.20+/20+ 抛 EINVAL |
+| `shell: false` + `"pi"` | ❌ 解析到 `pi.ps1`，参数错乱（原始报错来源） |
+| `shell: true` + `"pi"` | ✅ 由 cmd.exe 正确解析 shim |
+| 参数含空格 | ⚠️ 会被 shell 拆分，但 prompt 走 `--append-system-prompt <file>`，不受影响 |
+
+---
 
 ## 修复文件
 
 ```
 ~/.pi/agent/extensions/subagent/index.ts
-  - getPiInvocation()  加 Windows .cmd 解析
-  - spawn(...)         shell 标记跟随 invocation
+  getPiInvocation()  → Windows 返回 shell: true
+  spawn(...)         → shell 标记跟随 invocation
 ```
 
-修复后可正常 `subagent({agent:"quant", task:"..."})`。
+**生效方式**：`/reload` 或重启 pi。
