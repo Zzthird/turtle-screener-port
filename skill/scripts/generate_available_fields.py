@@ -5,8 +5,8 @@ Scans tushare_collector.py for all _safe_call invocations, extracts the
 endpoint name and requested fields, and writes a summary JSON file.
 
 Usage:
-    python3 scripts/generate_available_fields.py
-    python3 scripts/generate_available_fields.py --output output/available_fields.json
+    python scripts/generate_available_fields.py
+    python scripts/generate_available_fields.py --output output/available_fields.json
 """
 
 import argparse

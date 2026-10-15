@@ -6,9 +6,9 @@ Two-tier architecture:
   Tier 2: Per-stock deep analysis (~5s/stock)
 
 Usage:
-    python3 scripts/screener_core.py --tier1-only
-    python3 scripts/screener_core.py --tier2-limit 50
-    python3 scripts/screener_core.py --min-roe 15 --max-pe 30 --csv output/results.csv
+    python scripts/screener_core.py --tier1-only
+    python scripts/screener_core.py --tier2-limit 50
+    python scripts/screener_core.py --min-roe 15 --max-pe 30 --csv output/results.csv
 """
 
 from __future__ import annotations

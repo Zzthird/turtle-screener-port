@@ -5,7 +5,7 @@ Computes company classification, WACC, and multiple valuation methods
 (DCF, DDM, PE Band, PEG, PS) with sensitivity tables.
 
 Usage:
-    python3 scripts/valuation_engine.py --code 600887 --output-dir output/600887_伊利/
+    python scripts/valuation_engine.py --code 600887 --output-dir output/600887_伊利/
 """
 
 import argparse

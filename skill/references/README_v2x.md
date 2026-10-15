@@ -1,5 +1,18 @@
 # 龟龟投资框架 (Turtle Investment Framework)
 
+> 📌 **本文件为原仓库 README 存档**，保留原始 macOS/Linux 写法，便于对照上游。
+> 本文档中的 `.venv/bin/python`、`bash init.sh` 等命令在 **Windows / pi** 下需按下表替换：
+>
+> | 本文档写法 | Windows / pi 写法 |
+> |---|---|
+> | `.venv/bin/python` | `.venv\Scripts\python.exe` |
+> | `python3` | `python` |
+> | `bash init.sh` | `python -m venv .venv` + `.venv\Scripts\python.exe -m pip install -r requirements.txt` |
+> | `Bash("...")` / `mkdir -p x` | pi 的 powershell 工具 / `New-Item -ItemType Directory -Force x` |
+> | `Task(subagent_type=...)` | pi subagent 扩展（见 `agents/`） |
+>
+> 路径适配详情见项目 `notes/path-audit.md`。
+
 AI 辅助的 A 股/港股/美股基本面分析系统。混合架构：Python 脚本完成确定性数据采集，LLM 提示词驱动定性分析与多因子评估。
 
 > **当前版本：v2.0-beta** — PDF-first 单 Agent 架构 + 独立估值模块 + Pre-flight 合并 + 实战验证。详见 [CHANGELOG_V2.md](CHANGELOG_V2.md)。

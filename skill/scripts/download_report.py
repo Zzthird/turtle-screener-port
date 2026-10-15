@@ -6,7 +6,7 @@
 支持年报、中报、一季报、三季报。
 
 Usage:
-    python3 scripts/download_report.py \
+    python scripts/download_report.py \
         --url "https://stockn.xueqiu.com/.../report.pdf" \
         --stock-code SH600887 \
         --report-type 年报 \

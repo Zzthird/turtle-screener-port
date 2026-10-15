@@ -2,7 +2,7 @@
 """Convert qualitative_report.md to styled HTML dashboard.
 
 Usage:
-    python3 scripts/report_to_html.py \
+    python scripts/report_to_html.py \
         --input output/002078_太阳纸业/qualitative_report.md \
         --output output/002078_太阳纸业/qualitative_report.html
 

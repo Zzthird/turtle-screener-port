@@ -8,9 +8,9 @@ Collects 5 years of financial data from Tushare Pro API and outputs
 a structured data_pack_market.md file.
 
 Usage:
-    python3 scripts/tushare_collector.py --code 600887.SH
-    python3 scripts/tushare_collector.py --code 600887.SH --output output/data_pack.md
-    python3 scripts/tushare_collector.py --code 600887.SH --dry-run
+    python scripts/tushare_collector.py --code 600887.SH
+    python scripts/tushare_collector.py --code 600887.SH --output output/data_pack.md
+    python scripts/tushare_collector.py --code 600887.SH --dry-run
 """
 
 import argparse

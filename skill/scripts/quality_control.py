@@ -7,7 +7,7 @@ This eliminates the LLM unit-conversion / arithmetic-hallucination error class
 
 CLI::
 
-    python3 scripts/quality_control.py \
+    python scripts/quality_control.py \
         --input  output/{code}_{name}/data_pack_market.md \
         --output output/{code}_{name}/computed_metrics.md \
         [--pe-bands 10,15,20,25,30] [--discounts 1.0,0.9,0.8,0.7]

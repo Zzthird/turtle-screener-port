@@ -14,9 +14,9 @@ Target sections:
     SUB: Subsidiary holdings (主要控股参股公司)
 
 Usage:
-    python3 scripts/pdf_preprocessor.py --pdf report.pdf
-    python3 scripts/pdf_preprocessor.py --pdf report.pdf --output output/sections.json
-    python3 scripts/pdf_preprocessor.py --pdf report.pdf --verbose --dry-run
+    python scripts/pdf_preprocessor.py --pdf report.pdf
+    python scripts/pdf_preprocessor.py --pdf report.pdf --output output/sections.json
+    python scripts/pdf_preprocessor.py --pdf report.pdf --verbose --dry-run
 """
 
 from __future__ import annotations
