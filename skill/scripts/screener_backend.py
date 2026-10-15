@@ -472,6 +472,7 @@ class FreeScreenerBackend:
             return pd.DataFrame()
 
         rows = []
+        cur_year = _dt.date.today().year
         for rec in r:
             row = {"ts_code": ts_code}
             for k in ("加权ROE", "毛利率", "净利率", "每股净资产", "资产负债率"):
@@ -484,7 +485,148 @@ class FreeScreenerBackend:
                 row[tushare_key] = v.value if not v.missing else None
             p = rec.get("加权ROE").period or ""
             row["end_date"] = str(p)[:8] if p else ""
+            # ⚠️ 过滤未完成年度（如当前 2026 年，"20261231" 是未披露的年度）
+            ed = row["end_date"]
+            if len(ed) == 8 and ed[4:8] == "1231" and int(ed[:4]) >= cur_year:
+                continue
             if row.get("roe_waa") is not None or row.get("grossprofit_margin") is not None:
+                rows.append(row)
+        return pd.DataFrame(rows)
+
+    # -- 通用数据集调用（供 screener 的 Tier2 使用）-------------------
+    # Tushare 接口名 -> 数据层数据集名
+    _DS_MAP = {
+        "income": "利润表",
+        "cashflow": "现金流量表",
+        "dividend": "分红",
+        "yc_cb": "无风险利率",
+        "balancesheet": "资产负债表",
+        "fina_mainbz": "主营业务构成",
+        "top10_holders": "十大股东",
+        "pledge_stat": "股权质押",
+        "fina_audit": "财务审计",
+        "stock_basic": "股票基础信息",
+        "daily": "日线行情",
+        "weekly": "周线行情",
+        "daily_basic": "每日指标",
+    }
+
+    # 字段映射：Tushare 列名 -> 业务名（供 Tier2 代码消费）
+    _FIELD_ALIAS = {
+        "revenue": "营业收入", "oper_cost": "营业成本",
+        "n_income_attr_p": "归母净利润", "n_income": "净利润",
+        "total_profit": "利润总额", "income_tax": "所得税",
+        "minority_gain": "少数股东损益", "basic_eps": "基本EPS",
+        "sell_exp": "销售费用", "admin_exp": "管理费用",
+        "rd_exp": "研发费用", "finance_exp": "财务费用",
+        "operate_profit": "经营利润",
+        "n_cashflow_act": "经营活动现金流",
+        "c_pay_acq_const_fiolta": "资本开支",
+        "c_pay_dist_dpcp_int_exp": "已付股息",
+        "depr_fa_coga_dpba": "折旧摊销_固定资产",
+        "amort_intang_assets": "摊销_无形资产",
+        "lt_amort_deferred_exp": "摊销_长期待摊",
+        "money_cap": "货币资金", "accounts_receiv": "应收账款",
+        "contract_liab": "合同负债", "acct_payable": "应付账款",
+        "total_assets": "总资产", "total_liab": "总负债",
+        "total_hldr_eqy_exc_min_int": "归母权益", "total_share": "总股本",
+        "cash_div_tax": "每股股息", "end_date": "报告期",
+        "trade_date": "交易日期", "yield": "收益率",
+        "pledge_ratio": "质押比例", "audit_result": "审计结果",
+        "ann_date": "公告日", "ex_date": "除权日",
+        "div_proc": "分红进度", "stk_div": "送股比例",
+        "holder_name": "股东名", "hold_amount": "持股数量",
+        "hold_ratio": "持股比例",
+        # 中文字段（部分源直出中文列名）-> Tushare 风格
+        "支付给职工现金": "c_pay_to_staff",
+        "扣非归母净利润": "profit_dedt",
+        "投资活动现金流": "n_cashflow_inv_act",
+        "融资活动现金流": "n_cash_flows_fnc_act",
+        "处置固定资产收回": "n_recp_disp_fiolta",
+        "取得投资收益收到": "n_recp_inv_income",
+        "收到的税费返还": "n_recp_tax_rends",
+        "政府补助收到": "n_recp_grants",
+        "投资支付的现金": "c_pay_inv",
+        "取得子公司支付": "c_pay_acq_subsidiary",
+        "购买商品支付现金": "c_pay_goods",
+        "支付税费": "c_pay_taxes",
+        "分配股利偿付利息": "c_pay_dist_dpcp_int",
+        "曲线日期": "trade_date",
+    }
+
+    def dataset_call(self, api_name: str, code: str = None, **kwargs) -> pd.DataFrame:
+        """通用取数：把数据层的 Result 转成 Tushare 风格的 DataFrame。
+
+        - 列名从业务名回译为 Tushare 列名（screener 代码用的是 Tushare 命名）
+        - 无 ts_code 的数据集（如 yc_cb）直接取
+        """
+        import sys, os
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
+        from datasource import get
+
+        ts_code = code or kwargs.get("ts_code")
+        ds = self._DS_MAP.get(api_name)
+        if not ds:
+            return pd.DataFrame()
+        try:
+            r = get(ds, ts_code or "000001.SZ", source="auto")
+        except Exception:                             # noqa: BLE001
+            return pd.DataFrame()
+
+        rev = {v: k for k, v in self._FIELD_ALIAS.items()}
+        cur_year = _dt.date.today().year
+        rows = []
+        # 总股本（万股）——分红表无此列，从快照补
+        base_share = None
+        if api_name == "dividend":
+            try:
+                snap = self.snapshot()
+                hit = snap[snap["ts_code"] == (code or kwargs.get("ts_code"))]
+                if len(hit):
+                    mv = float(hit.iloc[0]["total_mv"])      # 万元
+                    cl = float(hit.iloc[0]["close"])         # 元
+                    if cl and cl == cl:
+                        base_share = mv / cl                 # 万股
+            except Exception:                         # noqa: BLE001
+                pass
+
+        for rec in r:
+            row = {}
+            period = None
+            for biz, v in rec.values.items():
+                col = rev.get(biz, biz)
+                # period-key 字段（报告期/交易日期）：只取 period，不取占位 value
+                if v.note == "period-key":
+                    if v.period:
+                        period = str(v.period)[:8]
+                    continue
+                if v.text is not None:
+                    row[col] = v.text
+                else:
+                    val = v.value
+                    # ⚠️ AkShare「派息」/「送股」是「每 10 股 X 元/股」，转每股权
+                    if api_name == "dividend" and col in ("cash_div_tax", "stk_div") \
+                       and val is not None:
+                        val = val / 10.0
+                    row[col] = val
+                if v.period and period is None:
+                    period = str(v.period)[:8]
+            # 期间列（统一填 end_date / trade_date）
+            if period:
+                row["end_date"] = period
+                row["trade_date"] = period
+            if base_share:
+                row["base_share"] = base_share
+                row["total_share"] = base_share
+            # 剔除未完成年度（如当前 2026 年时的 20261231）
+            ed = row.get("end_date") or ""
+            if api_name in ("income", "cashflow", "dividend") \
+               and len(str(ed)) == 8 and str(ed)[4:8] == "1231" \
+               and int(str(ed)[:4]) >= cur_year:
+                continue
+            if row:
                 rows.append(row)
         return pd.DataFrame(rows)
 

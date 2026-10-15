@@ -176,6 +176,8 @@ class TushareScreener:
             if ts_code:
                 return b.fina_indicator(ts_code)
             return pd.DataFrame()
+        if api_name in ("income", "cashflow", "dividend", "yc_cb"):
+            return b.dataset_call(api_name, ts_code, **kwargs)
         if api_name == "trade_cal":
             return b.trade_cal(kwargs.get("start_date", ""), kwargs.get("end_date", ""))
         # 未映射的接口：返回空表（调用方应能容忍）
@@ -469,11 +471,18 @@ class TushareScreener:
         if fi_df.empty:
             return False, metrics
 
-        # Use latest annual report
+        # Use latest 【completed】 annual report（排除未完成年度）
         fi_df = fi_df.sort_values("end_date", ascending=False)
-        annual = fi_df[fi_df["end_date"].str.endswith("1231")]
+        import datetime as _dtc
+        cur_year = _dtc.date.today().year
+        annual = fi_df[(fi_df["end_date"].str.endswith("1231")) &
+                       (fi_df["end_date"].str[:4].astype(int) < cur_year)]
         if annual.empty:
-            row = fi_df.iloc[0]
+            # 无已完成年报 -> 用最新一期（可能是中报），但标注
+            fi_df2 = fi_df[fi_df["end_date"].str[:4].astype(int) < cur_year]
+            if fi_df2.empty:
+                return False, metrics
+            row = fi_df2.iloc[0]
         else:
             row = annual.iloc[0]
 
@@ -692,41 +701,43 @@ class TushareScreener:
         else:
             result["M"] = None
 
-        # AA = 真实可支配现金结余 (latest 1 year)
+        # AA = 真实可支配现金结余（取近 N 年均值，默认 2 年；单年易受波动影响）
         # AA ≈ OCF + V1(资产处置) - V_deduct(补贴等) - |Capex|
         AA = None
-        if not cf_df.empty and not annual_inc.empty:
+        try:
+            aa_win = int(os.environ.get("SCREENER_AA_YEARS", "2"))
+        except ValueError:
+            aa_win = 2
+        if not cf_df.empty:
             cf_sorted = cf_df.sort_values("end_date", ascending=False)
-            annual_cf = cf_sorted[cf_sorted["end_date"].str.endswith("1231")]
-            if not annual_cf.empty:
-                latest_year = str(annual_cf.iloc[0]["end_date"])[:4]
-                cf_row = annual_cf.iloc[0]
-
-                # Find matching income row for same year
-                inc_row = None
-                for _, r in annual_inc.iterrows():
-                    if str(r["end_date"])[:4] == latest_year:
-                        inc_row = r
-                        break
-
-                if inc_row is not None:
-                    ocf_raw = cf_row.get("n_cashflow_act")
-                    ocf = float(ocf_raw) if ocf_raw is not None and pd.notna(ocf_raw) else None
-                    capex_raw = cf_row.get("c_pay_acq_const_fiolta")
-                    capex = abs(float(capex_raw)) if capex_raw is not None and pd.notna(capex_raw) else 0
-
-                    v1_raw = inc_row.get("asset_disp_income")
-                    v1 = float(v1_raw) if v1_raw is not None and pd.notna(v1_raw) else 0
-                    noi_raw = inc_row.get("non_oper_income")
-                    noi = float(noi_raw) if noi_raw is not None and pd.notna(noi_raw) else 0
-                    oi_raw = inc_row.get("oth_income")
-                    oi = float(oi_raw) if oi_raw is not None and pd.notna(oi_raw) else 0
-                    v_deduct = noi + oi
-
-                    if ocf is not None:
-                        AA = (ocf + v1 - v_deduct - capex) / 1e6  # 百万元
+            annual_cf = cf_sorted[cf_sorted["end_date"].astype(str).str.endswith("1231")]
+            import datetime as _dtc
+            annual_cf = annual_cf[annual_cf["end_date"].astype(str).str[:4].astype(int)
+                                  < _dtc.date.today().year]
+            aa_vals = []
+            for _, cf_row in annual_cf.head(aa_win).iterrows():
+                ocf_raw = cf_row.get("n_cashflow_act")
+                if ocf_raw is None or not pd.notna(ocf_raw):
+                    continue
+                capex_raw = cf_row.get("c_pay_acq_const_fiolta")
+                capex = abs(float(capex_raw)) if capex_raw is not None and pd.notna(capex_raw) else 0
+                # 非经常项（从利润表同年度取；字段缺失则计 0）
+                v_deduct = 0.0
+                v1 = 0.0
+                yr = str(cf_row["end_date"])[:4]
+                inc_hit = annual_inc[annual_inc["end_date"].astype(str).str[:4] == yr]
+                if len(inc_hit):
+                    ir = inc_hit.iloc[0]
+                    for c in ("non_oper_income", "oth_income"):
+                        rv = ir.get(c)
+                        if rv is not None and pd.notna(rv):
+                            v_deduct += float(rv)
+                aa_vals.append((float(ocf_raw) + v1 - v_deduct - capex) / 1e6)  # 百万元
+            if aa_vals:
+                AA = sum(aa_vals) / len(aa_vals)
 
         result["AA"] = AA
+        result["AA_years"] = len(aa_vals) if aa_vals else 0
 
         # R = AA × M / mkt_cap  (O=0, 无法区分回购用途)
         if AA is not None and result.get("M") is not None and mkt_cap > 0:
