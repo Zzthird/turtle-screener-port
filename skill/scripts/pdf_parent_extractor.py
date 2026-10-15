@@ -19,10 +19,27 @@ from typing import Optional
 
 # 目标报表 → 标题关键词（按顺序匹配，避免"合并"误命中）
 REPORTS = {
-    "母公司资产负债表": ["母公司资产负债表"],
-    "母公司利润表": ["母公司利润表"],
-    "母公司现金流量表": ["母公司现金流量表"],
+    "母公司资产负债表": ["母公司资产负债表", "本行资产负债表"],
+    "母公司利润表": ["母公司利润表", "本行利润表"],
+    "母公司现金流量表": ["母公司现金流量表", "本行现金流量表"],
 }
+
+# 标题变体（带"续"、换行、空格）
+_TITLE_NOISE = re.compile(r"[\s　\u3000\-—·]+")
+
+# 标题必须位于页面靠前位置（排除审计报告/附注里的提及）
+_TITLE_MAX_POS = 400
+
+# 干扰页特征（审计报告 / 附注提及）
+_NOISE_PAGE = ["审计报告", "审阅报告", "毕马威华振审字", "天职业字", "XYZH/"]
+
+# 单位识别（部分公司用百万元，如中国神华）
+_UNIT_PATTERNS = [
+    (re.compile(r"单位[：:]\s*人民币?百万元"), "百万元"),
+    (re.compile(r"金额单位[：:]\s*人民币?百万元"), "百万元"),
+    (re.compile(r"单位[：:]\s*万元"), "万元"),
+    (re.compile(r"单位[：:]\s*元"), "元"),
+]
 
 # 科目名 → 输出业务名（与 schema 对齐）
 BALANCE_ITEMS = {
@@ -106,6 +123,7 @@ class ReportTable:
     page: int
     years: list[str] = field(default_factory=list)     # ["2024", "2023"]
     items: dict[str, list[Optional[float]]] = field(default_factory=dict)
+    unit: str = "元"                                    # 原始单位（需转换）
 
 
 def _to_num(s: str) -> Optional[float]:
@@ -120,7 +138,127 @@ def _to_num(s: str) -> Optional[float]:
         return None
 
 
+def _detect_unit(text: str) -> str:
+    """从页面文本识别报表单位。实测：中国神华用百万元，其余多为元。"""
+    for pat, unit in _UNIT_PATTERNS:
+        if pat.search(text):
+            return unit
+    return "元"
+
+
+def _has_title(text: str, name: str) -> bool:
+    """标题匹配：标题必须**独占一行**（避免审计报告/附注中夹在句子里的提及）。
+
+    支持"母公司资产负债表（续）"、"本行资产负债表"（银行）。
+    """
+    kws = [_TITLE_NOISE.sub("", k) for k in REPORTS.get(name, [name])]
+    for line in text.splitlines():
+        flat = _TITLE_NOISE.sub("", line)
+        if not flat:
+            continue
+        for kw in kws:
+            # 标题行：以关键词开头，或形如 "2、母公司资产负债表"
+            if flat.startswith(kw) or flat.lstrip("0123456789、.（）()").startswith(kw):
+                # 排除正文里引用的句子（行太长）
+                if len(flat) <= len(kw) + 12:
+                    return True
+    return False
+
+
+def _guess_report_year(text: str) -> Optional[int]:
+    """从页面文本猜报告年（如 "2024年12月31日"）。"""
+    m = re.search(r"(20\d{2})\s*年\s*12\s*月\s*31\s*日", text)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(20\d{2})\s*年?\s*1[]—\-~至]\s*12\s*月", text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _is_toc_page(text: str) -> bool:
+    """目录页判定：点线引导符或大量页码。"""
+    if "......" in text or "…" in text or "‧‧" in text:
+        return True
+    # 短页面 + 行尾多为数字（目录特征）
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) > 8:
+        tail_num = sum(1 for l in lines if l.rstrip().endswith(tuple("0123456789")))
+        if tail_num / len(lines) > 0.7 and sum(len(l) for l in lines) / len(lines) < 30:
+            return True
+    return False
+
+
+# 表格提取策略（实测）
+#   lines: 默认，适合有框线的报表
+#   text : 适合无框线报表（如中国神华），按文字位置推断列
+_TABLE_SETTINGS = [
+    {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
+    {"vertical_strategy": "text", "horizontal_strategy": "text"},
+]
+
+
+def _extract_tables(page) -> list[list[list[str]]]:
+    """多策略表格提取（lines 优先，text 回退）。"""
+    for st in _TABLE_SETTINGS:
+        try:
+            tbs = [t for t in page.extract_tables(table_settings=st) if t and len(t) >= 3]
+            if tbs:
+                return tbs
+        except Exception:                           # noqa: BLE001
+            continue
+    return []
+
+
 def _find_header_row(table: list[list[str]]) -> tuple[int, list[str]]:
+    """定位表头行，返回 (行号, 年份列表)。
+
+    常见表头形式：
+      项目 | 附注 | 2024年12月31日 | 2023年12月31日   -> 年份
+      项目 | 期末余额 | 期初余额                       -> 无年份，回退
+    """
+    for i, row in enumerate(table[:8]):
+        cells = [(c or "").strip() for c in row]
+        years = []
+        for c in cells:
+            m = _YEAR.search(c)
+            if m and ("年" in c or "月" in c or c.strip().startswith("20")):
+                years.append(m.group(1))
+        if len(years) >= 1:
+            return i, years
+        # 跨行：本行只有"附注"，下行才是年份
+        if i + 1 < len(table):
+            nxt = [(c or "").strip() for c in table[i + 1]]
+            ys = [_YEAR.search(c).group(1) for c in nxt
+                  if _YEAR.search(c) and ("年" in c or "月" in c or c.startswith("20"))]
+            if ys:
+                return i + 1, ys
+    # 无年份：找"期末余额/期初余额"，用占位符（后续由 PDF 元信息补年份）
+    for i, row in enumerate(table[:8]):
+        flat = "".join((c or "") for c in row)
+        if "期末余额" in flat or "期末数" in flat or "年末余额" in flat:
+            return i, ["T", "T-1"]
+    return -1, []
+
+
+def _label_col(table: list[list[str]]) -> int:
+    """定位科目名称所在列（部分报表第一列全空）。"""
+    # 看表头行哪个单元格是"项目"
+    for row in table[:8]:
+        for ci, c in enumerate(row):
+            t = (c or "").strip()
+            if t in ("项目", "项　目", "科目", "资产", "负债和股东权益"):
+                return ci
+    # 回退：找含文字最多的列（前 20 行）
+    widths = {}
+    for row in table[:20]:
+        for ci, c in enumerate(row):
+            s = (c or "").strip()
+            if s and not _NUM.match(s.replace(",", "")):
+                widths[ci] = widths.get(ci, 0) + 1
+    if widths:
+        return max(widths, key=widths.get)
+    return 0
     """定位表头行，返回 (行号, 年份列表)。"""
     for i, row in enumerate(table[:6]):
         cells = [(c or "").strip() for c in row]
@@ -140,10 +278,11 @@ def _collect_items(tables: list[list[list[str]]], name: str,
     all_items = ITEM_MAPS[name]
     items: dict[str, list[Optional[float]]] = {}
     for best in tables:
+        lc = _label_col(best)                 # 科目所在列
         for row in best:
-            if not row:
+            if not row or len(row) <= lc:
                 continue
-            label = str(row[0] or "")
+            label = str(row[lc] or "")
             # 去掉缩进/编号/量词前缀：减：营业成本 / 其中：应收利息 / 一、营业收入
             label = (label.replace("　", "").replace(" ", "").replace("\n", "")
                      .lstrip("-—").strip())
@@ -156,7 +295,7 @@ def _collect_items(tables: list[list[list[str]]], name: str,
                 if biz in items:
                     continue
                 if label == anchor or label.startswith(anchor):
-                    vals = [_to_num(str(c or "")) for c in row[1:]]
+                    vals = [_to_num(str(c or "")) for c in row[lc + 1:]]
                     nums = [v for v in vals if v is not None]
                     if nums:
                         items[biz] = nums[:len(years)] if years else nums
@@ -182,13 +321,13 @@ def extract_parent_reports(pdf_path: str, verbose: bool = False) -> dict[str, Re
             for name, keys in REPORTS.items():
                 if name in found:
                     continue
-                if not any(k in text for k in keys):
+                if not _has_title(text, name):
                     continue
-                # 页级过滤：排除目录页（含点线）
-                if "......" in text or "…" in text:
+                # 页级过滤：排除目录页
+                if _is_toc_page(text):
                     continue
 
-                tables = [t for t in page.extract_tables() if t]
+                tables = _extract_tables(page)
                 if not tables:
                     continue
 
@@ -200,16 +339,19 @@ def extract_parent_reports(pdf_path: str, verbose: bool = False) -> dict[str, Re
                 if not years:
                     continue
 
-                # 跨页续表：向后扫描若干页，直到出现下一张母公司报表标题
+                unit = _detect_unit(text)
+
+                # 跨页续表：向后扫描，直到出现下一张报表标题
                 chain = list(tables)
                 j = pno + 1
-                while j < n_pages and j <= pno + 3:
+                while j < n_pages and j <= pno + 4:
                     nt = pdf.pages[j].extract_text() or ""
-                    if any(k in nt for k in sum(REPORTS.values(), [])):
-                        break                       # 下一张报表开始了
-                    if "......" in nt:
+                    # 任何母公司报表标题（包括本报表的"（续）"会继续）
+                    if any(_has_title(nt, k) for k in REPORTS) and not _has_title(nt, name):
                         break
-                    more = [t for t in pdf.pages[j].extract_tables() if t]
+                    if _is_toc_page(nt):
+                        break
+                    more = _extract_tables(pdf.pages[j])
                     if not more:
                         break
                     chain.extend(more)
@@ -217,11 +359,16 @@ def extract_parent_reports(pdf_path: str, verbose: bool = False) -> dict[str, Re
 
                 items = _collect_items(chain, name, years)
                 if items:
+                    # 占位年份 T/T-1 -> 用 PDF 里的报告年份回填
+                    if years and years[0] == "T":
+                        ry = _guess_report_year(text) or _guess_report_year(pdf_path)
+                        if ry:
+                            years = [str(ry), str(ry - 1)]
                     found[name] = ReportTable(name=name, page=pno + 1,
-                                              years=years, items=items)
+                                              years=years, items=items, unit=unit)
                     if verbose:
                         span = f"第 {pno+1}" + (f"-{j}" if j > pno + 1 else "") + " 页"
-                        print(f"  找到 {name} @ {span}，{len(items)} 个科目，年份 {years}")
+                        print(f"  找到 {name} @ {span}，{len(items)} 科目，年份 {years}，单位 {unit}")
 
     return found
 
@@ -251,14 +398,20 @@ def to_rows(reports: dict[str, ReportTable]) -> dict[str, list[dict]]:
     """转成 collector 可用的行格式：{数据集名: [行...]}。
 
     行格式与 datasource 的 Value dict 对齐，便于直接接入 data_collector。
+    数值统一转为【元】（供下游 /1e6 成百万元）。
     """
-    def mk(items: dict, years: list[str]) -> list[dict]:
+    _SCALE = {"元": 1.0, "万元": 1e4, "百万元": 1e6}
+
+    def mk(items: dict, years: list[str], unit: str) -> list[dict]:
+        scale = _SCALE.get(unit, 1.0)
         rows = []
         n = len(years) if years else 1
         for i in range(n):
             row: dict = {}
             for biz, vals in items.items():
                 v = vals[i] if i < len(vals) else None
+                if v is not None:
+                    v = v * scale               # 归一化到元
                 row[biz] = {"value": v, "unit": "元", "currency": "CNY",
                             "period": (years[i] + "1231") if i < len(years) else None,
                             "source": "cninfo_pdf"}
@@ -266,15 +419,10 @@ def to_rows(reports: dict[str, ReportTable]) -> dict[str, list[dict]]:
         return rows
 
     out: dict[str, list[dict]] = {}
-    if "母公司利润表" in reports:
-        r = reports["母公司利润表"]
-        out["母公司利润表"] = mk(r.items, r.years)
-    if "母公司资产负债表" in reports:
-        r = reports["母公司资产负债表"]
-        out["母公司资产负债表"] = mk(r.items, r.years)
-    if "母公司现金流量表" in reports:
-        r = reports["母公司现金流量表"]
-        out["母公司现金流量表"] = mk(r.items, r.years)
+    for name in ("母公司利润表", "母公司资产负债表", "母公司现金流量表"):
+        r = reports.get(name)
+        if r:
+            out[name] = mk(r.items, r.years, r.unit)
     return out
 
 

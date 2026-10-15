@@ -16,10 +16,14 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 QUERY_URL = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
+SEARCH_URL = "http://www.cninfo.com.cn/new/information/topSearch/query"
 STATIC_BASE = "http://static.cninfo.com.cn/"
 
-# 交易所前缀映射（巨潮要求 orgId 格式，实测用 gssh0/gssz0 后缀亦可）
+# 交易所前缀映射
 _PLATE = {"SH": "sh", "SZ": "sz", "BJ": "bj"}
+
+# orgId 缓存（实测：无法用公式推导，必须查）
+_ORG_CACHE: dict[str, str] = {}
 
 
 class CninfoError(Exception):
@@ -39,24 +43,47 @@ def _session():
     return s
 
 
+def resolve_org_id(num: str, session=None) -> str:
+    """查巨潮 orgId。实测无法用公式推导（如 600519->gssh0600519 但 601088->9900003701）。"""
+    if num in _ORG_CACHE:
+        return _ORG_CACHE[num]
+    s = session or _session()
+    try:
+        r = s.post(SEARCH_URL, data={"keyWord": num, "maxNum": 10}, timeout=25)
+        j = r.json()
+        for x in (j if isinstance(j, list) else []):
+            if str(x.get("code")) == num:
+                org = x.get("orgId") or ""
+                if org:
+                    _ORG_CACHE[num] = org
+                    return org
+    except Exception:                               # noqa: BLE001
+        pass
+    return ""
+
+
 def query_annual_reports(code: str, year: int, page_size: int = 30) -> list[dict]:
     """查询年报公告列表。code 如 600887.SH。返回 [{title, url, date}]。"""
     num, _, mkt = code.partition(".")
     mkt = mkt.upper() or ("SH" if num.startswith("6") else "SZ")
-    column = _PLATE.get(mkt, "sz") + "se"
+    # column 按交易所：上交所 sse / 深交所 szse / 北交所 bjse
+    col_base = {"SH": "sse", "SZ": "szse", "BJ": "bjse"}.get(mkt, "szse")
+    column = col_base
 
-    # 巨潮 stock 参数格式：600887,gssh0600887
-    org = f"gss{_PLATE.get(mkt,'sh')}0{num}"
+    s = _session()
+    org = resolve_org_id(num, s)
+    stock = f"{num},{org}" if org else num
+
+    # 年报在【次年】披露：2024 年报 -> 2025-01-01~2025-12-31
     payload = {
         "pageNum": 1, "pageSize": page_size,
         "column": column, "tabName": "fulltext",
-        "plate": "", "stock": f"{num},{org}",
+        "plate": "", "stock": stock,
         "searchkey": "", "secid": "",
         "category": "category_ndbg_szsh",
-        "trade": "", "seDate": f"{year}-01-01~{year+1}-12-31",
+        "trade": "", "seDate": f"{year+1}-01-01~{year+1}-12-31",
         "sortName": "", "sortType": "", "isHLtitle": "true",
     }
-    s = _session()
     try:
         r = s.post(QUERY_URL, data=payload, timeout=30)
         j = r.json()
@@ -66,10 +93,13 @@ def query_annual_reports(code: str, year: int, page_size: int = 30) -> list[dict
     out: list[dict] = []
     for a in (j.get("announcements") or []):
         title = (a.get("announcementTitle") or "").replace("<em>", "").replace("</em>", "")
-        # 排除摘要/英文版，保留正式年报
-        if "摘要" in title or "英文" in title or "已取消" in title:
+        # 排除摘要/英文版/已取消
+        if any(k in title for k in ["摘要", "英文", "已取消", "公告"]):
             continue
+        # 标题形式兼容「2024年年度报告」/「2024年度报告」
         if str(year) not in title:
+            continue
+        if not any(k in title for k in ["年度报告", "年报"]):
             continue
         out.append({
             "title": title,
