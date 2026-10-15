@@ -159,6 +159,25 @@ CASHFLOW_FIELDS: list[FieldSpec] = [
     FieldSpec("支付给职工现金", "元", "c_pay_to_staff", False, "c_pay_to_staff", None, "支付给职工以及为职工支付的现金"),
     FieldSpec("投资活动现金流", "元", "n_cashflow_inv_act", False, "n_cashflow_inv_act", "NETCASH_INVEST", None),
     FieldSpec("融资活动现金流", "元", "n_cash_flows_fnc_act", False, "n_cash_flows_fnc_act", "NETCASH_FINANCE", None),
+    # ── §17.3/17.4/17.5 所需（步骤3/4/5/6）──
+    FieldSpec("处置固定资产收回", "元", "n_recp_disp_fiolta", False, "n_recp_disp_fiolta",
+             "处置固定资产、无形资产和其他长期资产所收回的现金净额", "处置固定资产、无形资产和其他长期资产所收回的现金净额"),
+    FieldSpec("取得投资收益收到", "元", "n_recp_inv_income", False, "n_recp_inv_income",
+             "取得投资收益收到的现金", "取得投资收益收到的现金"),
+    FieldSpec("收到的税费返还", "元", "n_recp_tax_rends", False, "n_recp_tax_rends",
+             "收到的税费返还", "收到的税费返还"),
+    FieldSpec("政府补助收到", "元", "n_recp_grants", False, "n_recp_grants",
+             "收到的其他与经营活动有关的现金", "收到的其他与经营活动有关的现金"),
+    FieldSpec("投资支付的现金", "元", "c_pay_inv", False, "c_pay_inv",
+             "投资所支付的现金", "投资所支付的现金"),
+    FieldSpec("取得子公司支付", "元", "c_pay_acq_subsidiary", False, "c_pay_acq_subsidiary",
+             "取得子公司及其他营业单位支付的现金净额", "取得子公司及其他营业单位支付的现金净额"),
+    FieldSpec("购买商品支付现金", "元", "c_pay_goods", False, "c_pay_goods",
+             "购买商品、接受劳务支付的现金", "购买商品、接受劳务支付的现金"),
+    FieldSpec("支付税费", "元", "c_pay_taxes", False, "c_pay_taxes",
+             "支付的各项税费", "支付的各项税费"),
+    FieldSpec("分配股利偿付利息", "元", "c_pay_dist_dpcp_int", False, "c_pay_dist_dpcp_int",
+             "分配股利、利润或偿付利息所支付的现金", "分配股利、利润或偿付利息所支付的现金"),
 ]
 
 # ============ 财务指标 (fina_indicator) ============

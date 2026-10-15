@@ -274,22 +274,34 @@ def s17_10(c: Ctx) -> tuple[str, Optional[float], str]:
     return "\n".join(L), (rec / 100 if rec else None), src
 
 
-def s17_11(c: Ctx, M: Optional[float], II: float) -> tuple[str, list]:
-    """§17.11 税后穿透回报率网格 + 目标买入价。"""
+def s17_11(c: Ctx, M: Optional[float], II: float,
+            aa_variants: Optional[dict] = None) -> tuple[str, list]:
+    """§17.11 税后穿透回报率网格 + 目标买入价。
+
+    aa_variants 优先用 §17.5 的完整 11 步口径；缺失时回退 OCF−Capex。
+    """
     if not M or not c.mktcap:
         return "### §17.11 穿透回报率网格\n\n> ⚠️ 缺 M 或市值，跳过。\n", []
 
     ni = c.inc.get("归母净利润", {})
     C = ni.get(c.years[0])
-    # AA 变体：OCF - Capex
-    aa = {}
-    for y in c.years[:5]:
-        o = c.cf.get("经营活动现金流", {}).get(y)
-        cp = c.cf.get("资本开支", {}).get(y)
-        if o and cp:
-            aa[y] = o - cp
-    aa2 = mean([aa.get(y) for y in c.years[:2]])
-    aaall = mean(list(aa.values()))
+
+    if aa_variants and aa_variants.get("AA_2y") is not None:
+        aa2 = aa_variants.get("AA_2y")
+        aaall = aa_variants.get("AA_all")
+        aaexcl = aa_variants.get("AA_excl")
+        aa_src = "§17.5（完整 11 步）"
+    else:
+        aa = {}
+        for y in c.years[:5]:
+            o = c.cf.get("经营活动现金流", {}).get(y)
+            cp = c.cf.get("资本开支", {}).get(y)
+            if o and cp:
+                aa[y] = o - cp
+        aa2 = mean([aa.get(y) for y in c.years[:2]])
+        aaall = mean(list(aa.values()))
+        aaexcl = None
+        aa_src = "OCF−Capex（简化，§17.5 缺失时回退）"
 
     # 税率情景（A股默认 Q=0）
     QS = [0.0] if str(c.info.get("代码", "")) == "1" else [0.0, 0.1, 0.2]
@@ -297,16 +309,17 @@ def s17_11(c: Ctx, M: Optional[float], II: float) -> tuple[str, list]:
     QS = [0.0, 0.1, 0.2]
 
     rows = []
-    for label, base in [("AA_2y", aa2), ("AA_all", aaall), ("C(粗算)", C)]:
+    for label, base in [("AA_2y", aa2), ("AA_all", aaall), ("AA_excl", aaexcl), ("C(粗算)", C)]:
+        if base is None:
+            continue
         for q in QS:
-            val = base * M * (1 - q) / c.mktcap * 100 if base else None
-            if val is None:
-                continue
+            val = base * M * (1 - q) / c.mktcap * 100
             tgt = (c.price * val / II) if (c.price and II) else None
             rows.append((label, q * 100, base, val, val - II, tgt))
 
     L = ["### §17.11 穿透回报率网格（税后）", "",
-         f"基准：市值 {c.mktcap:,.0f} 百万元 | 门槛 II = {II:.2f}% | M_rec = {M:.4f}", "",
+         f"基准：市值 {c.mktcap:,.0f} 百万元 | 门槛 II = {II:.2f}% | M_rec = {M:.4f}",
+         f"AA 口径：{aa_src}", "",
          "| 基准值 | 变体 | Q(%) | 基准(百万元) | 回报率(%) | GG−II(pct) | 目标买入价 |",
          "|---|---|---|---|---|---|---|"]
     tgt_default = None
@@ -474,6 +487,191 @@ def s17_6(c: Ctx) -> str:
 # main
 # ---------------------------------------------------------------------------
 
+def s17_3(c: Ctx) -> str:
+    """§17.3 真实现金收入（步骤3）。"""
+    rev = c.inc.get("营业收入", {})
+    ar = c.bal.get("应收账款", {})
+    cl = c.bal.get("合同负债", {}) or c.bal.get("预收款项", {})
+    yrs = [y for y in c.years if rev.get(y)]
+    L = ["### §17.3 真实现金收入还原（步骤3）", "",
+         "保守规则：AR 净增扣除 / 预收净增不加回", "",
+         "| 年份 | 营业收入 | AR净变动 | 预收净变动 | 真实现金收入 | 收款比率 |",
+         "|---|---|---|---|---|---|"]
+    rows = []
+    for i, y in enumerate(yrs):
+        S = rev.get(y)
+        T = None
+        U = None
+        if i + 1 < len(yrs):
+            yn = yrs[i + 1]
+            if ar.get(y) is not None and ar.get(yn) is not None:
+                T = ar[y] - ar[yn]
+            if cl.get(y) is not None and cl.get(yn) is not None:
+                U = cl[y] - cl[yn]
+        cash = None
+        if S is not None:
+            cash = S - (T or 0) - (max(U, 0) if U else 0)
+            # 预收净减少 -> 扣除；净增加不加回（已隐含）
+            if U is not None and U < 0:
+                cash = S - (T or 0) - 0   # 减少已在 S 之外，额外扣除见下
+        ratio = (cash / S * 100) if (cash is not None and S) else None
+        rows.append((y, S, T, U, cash, ratio))
+        L.append("| %s | %s | %s | %s | %s | %s |" % (
+            y, fx(S, 0), fx(T, 0), fx(U, 0), fx(cash, 0),
+            (f"{ratio:.2f}%" if ratio is not None else "—")))
+    L += ["", "> 收款比率 < 100% 表示收入未全额转化为现金（应收占用）。"]
+    L.append("")
+    return "\n".join(L)
+
+
+def s17_4(c: Ctx) -> str:
+    """§17.4 经营性现金支出还原（步骤5）。"""
+    cost = c.inc.get("营业成本", {})
+    ap = c.bal.get("应付账款", {})
+    staff = c.cf.get("支付给职工现金", {})
+    tax = c.inc.get("所得税", {})
+    dta = c.bal.get("递延所得税资产", {})
+    dtl = c.bal.get("递延所得税负债", {})
+    fin = c.inc.get("财务费用", {})
+    yrs = [y for y in c.years if cost.get(y)]
+    L = ["### §17.4 经营性现金支出还原（步骤5）", "",
+         "| 年份 | W1 供应商 | W2 员工 | W3 税款 | W4 利息 | W 合计 |",
+         "|---|---|---|---|---|---|"]
+    for i, y in enumerate(yrs):
+        W1 = cost.get(y)
+        if i + 1 < len(yrs):
+            yn = yrs[i + 1]
+            if ap.get(y) is not None and ap.get(yn) is not None:
+                W1 = (W1 or 0) + (ap[yn] - ap[y])   # 应付净减少 -> 多付现金
+        W2 = staff.get(y)
+        W3 = tax.get(y)
+        if W3 is not None:
+            dd = 0.0
+            if i + 1 < len(yrs):
+                yn = yrs[i + 1]
+                for ds in (dta, dtl):
+                    if ds.get(y) is not None and ds.get(yn) is not None:
+                        dd += ds[y] - ds[yn]
+            W3 = W3 - dd if dd else W3
+        W4 = fin.get(y)
+        W = sum(x for x in (W1, W2, W3, W4) if x is not None) or None
+        L.append("| %s | %s | %s | %s | %s | %s |" % (
+            y, fx(W1, 0), fx(W2, 0), fx(W3, 0), fx(W4, 0), fx(W, 0)))
+    L += ["", "W1 = 营业成本 + 应付净减少（保守）；W3 = 所得税 − 递延税变动。", ""]
+    return "\n".join(L)
+
+
+def s17_5(c: Ctx) -> tuple[str, dict, dict]:
+    """§17.5 真实可支配现金结余（步骤8）。返回 (md, AA变体, 逐年结余)。"""
+    rev = c.inc.get("营业收入", {})
+    ar = c.bal.get("应收账款", {})
+    cl = c.bal.get("合同负债", {}) or c.bal.get("预收款项", {})
+    cost = c.inc.get("营业成本", {})
+    ap = c.bal.get("应付账款", {})
+    staff = c.cf.get("支付给职工现金", {})
+    tax = c.inc.get("所得税", {})
+    fin = c.inc.get("财务费用", {})
+    capex = c.cf.get("资本开支", {})
+    inv_pay = c.cf.get("投资支付的现金", {})
+    acq = c.cf.get("取得子公司支付", {})
+    disp = c.cf.get("处置固定资产收回", {})
+    inv_inc = c.cf.get("取得投资收益收到", {})
+    ocf = c.cf.get("经营活动现金流", {})
+
+    yrs = [y for y in c.years if rev.get(y)]
+    L = ["### §17.5 真实可支配现金结余（步骤8）", "",
+         "结余 = 真实现金收入 + V1 + V5 − W − Y（Y = 资本开支 + 收购/参股）",
+         "> ⚠️ 投资支付的现金（理财/定存滚动）**不扣除** —— 属现金形态转换而非消耗。", "",
+         "| 年份 | 真实现金收入 | +处置V1 | +投资V5 | −经营支出W | −总扣除Y | =结余 |",
+         "|---|---|---|---|---|---|---|"]
+    bal: dict[str, float] = {}
+    for i, y in enumerate(yrs):
+        S = rev.get(y) or 0
+        T = U = 0
+        if i + 1 < len(yrs):
+            yn = yrs[i + 1]
+            if ar.get(y) is not None and ar.get(yn) is not None:
+                T = ar[y] - ar[yn]
+            if cl.get(y) is not None and cl.get(yn) is not None:
+                U = cl[y] - cl[yn]
+        cash_rev = S - T - (abs(U) if U and U < 0 else 0)
+        W1 = cost.get(y) or 0
+        if i + 1 < len(yrs):
+            yn = yrs[i + 1]
+            if ap.get(y) is not None and ap.get(yn) is not None:
+                W1 += (ap[yn] - ap[y])
+        W = W1 + (staff.get(y) or 0) + (tax.get(y) or 0) + (fin.get(y) or 0)
+        Y = (capex.get(y) or 0) + (acq.get(y) or 0)
+        v1 = disp.get(y) or 0
+        v5 = inv_inc.get(y) or 0
+        b = cash_rev + v1 + v5 - W - Y
+        bal[y] = b
+        L.append("| %s | %s | %s | %s | %s | %s | %s |" % (
+            y, fx(cash_rev, 0), fx(v1, 0), fx(v5, 0), fx(W, 0), fx(Y, 0), fx(b, 0)))
+
+    ys = [y for y in yrs if y in bal]
+    aa2 = mean([bal[y] for y in ys[:2]])
+    aaall = mean([bal[y] for y in ys])
+    # AA_excl：剔除「保留项 > OCF×50%」的非经营主导年份
+    keep = [y for y in ys
+            if not (ocf.get(y) and (disp.get(y, 0) + inv_inc.get(y, 0)) > ocf[y] * 0.5)]
+    aaexcl = mean([bal[y] for y in keep]) if len(keep) >= 2 else None
+
+    L += ["", f"- **AA_2y = {fx(aa2, 0)}**（近2年均值，默认基准）",
+          f"- **AA_all = {fx(aaall, 0)}**（全部年份均值）",
+          f"- **AA_excl = {fx(aaexcl, 0)}**（剔除非经营主导年份，保留 {len(keep)} 年）", ""]
+    return "\n".join(L), {"AA_2y": aa2, "AA_all": aaall, "AA_excl": aaexcl}, bal
+
+
+def s17_9(c: Ctx, AA: Optional[float], M: Optional[float], II: float) -> str:
+    """§17.9 业绩下滑敏感性。"""
+    if not AA or not M or not c.mktcap:
+        return "### §17.9 业绩下滑敏感性\n\n> ⚠️ 参数不足。\n"
+    L = ["### §17.9 业绩下滑敏感性", "",
+         "| 情景 | 结余 | 穿透回报率(%) | 门槛价格(元) | vs 现价 |",
+         "|---|---|---|---|---|"]
+    for label, k in [("基准", 1.0), ("-10%", 0.9), ("-20%", 0.81), ("-30%", 0.729)]:
+        a = AA * k
+        gg = a * M / c.mktcap * 100
+        tp = (c.price * gg / II) if (c.price and II) else None
+        vs = ((tp / c.price - 1) * 100) if (tp and c.price) else None
+        L.append(f"| {label} | {fx(a,0)} | {gg:.2f} | {fx(tp)} | {fx(vs)}% |")
+    L.append("")
+    return "\n".join(L)
+
+
+def s17_8(c: Ctx, AA: Optional[float], M: Optional[float]) -> str:
+    """§17.8 绝对估值仪表盘 + 地板价基准。"""
+    L = ["### §17.8 绝对估值仪表盘", ""]
+    ni = c.inc.get("归母净利润", {})
+    C = ni.get(c.years[0])
+    ocf = c.cf.get("经营活动现金流", {}).get(c.years[0])
+    capex = c.cf.get("资本开支", {}).get(c.years[0])
+    if C and c.mktcap:
+        L.append(f"- PE（归母，百万元口径）= {c.mktcap/C:.2f}x")
+    if c.price and c.ind.get("每股净资产", {}):
+        bps = c.ind["每股净资产"].get(c.years[0])
+        if bps:
+            L.append(f"- PB = {c.price/bps:.2f}x")
+    if ocf and capex:
+        fcf = ocf - capex
+        if c.mktcap:
+            L.append(f"- FCF（OCF−Capex）= {fcf:,.0f} 百万元")
+            L.append(f"- **FCF 收益率 = {fcf/c.mktcap*100:.2f}%**")
+    if c.price and C and c.shares_wan:
+        eps = C / (c.shares_wan * 1e4) * 1e6 / 1e6   # 百万元 / 万股 -> 元/股
+        eps = C * 1e6 / (c.shares_wan * 1e4)
+        L.append(f"- EPS（归母/股本）= {eps:.3f} 元/股")
+        if eps > 0:
+            L.append(f"- 扣除现金 PE 参考 = {c.price:.2f} / {eps:.3f} = {c.price/eps:.2f}x")
+    ta = c.bal.get("总资产", {}).get(c.years[0])
+    gw = c.bal.get("商誉", {}).get(c.years[0])
+    if ta and gw:
+        L.append(f"- 商誉/总资产 = {gw/ta*100:.2f}%")
+    L.append("")
+    return "\n".join(L)
+
+
 def build(text: str) -> str:
     c = Ctx(text)
     II = c.II()
@@ -481,13 +679,19 @@ def build(text: str) -> str:
              "> 本段由 `derived_metrics_local.py` 从 datapack **确定性计算**，无 LLM 判断成分。",
              "> **Agent 禁止重算**：有网格时只许「查表选行 + 说明理由」。", ""]
     parts.append(s17_1(c))
+    parts.append(s17_3(c))
+    parts.append(s17_4(c))
+    s5, aa_variants, _bal = s17_5(c)
+    parts.append(s5)
     parts.append(s17_6(c))
     s10, M, src = s17_10(c)
     parts.append(s10)
     parts.append(s17_2(c, M))
-    s11, _ = s17_11(c, M, II)
+    s11, _ = s17_11(c, M, II, aa_variants)
     parts.append(s11)
     parts.append(s17_12(c))
+    parts.append(s17_8(c, aa_variants.get("AA_2y"), M))
+    parts.append(s17_9(c, aa_variants.get("AA_2y"), M, II))
     parts.append(s17_13(c))
     return "\n".join(parts)
 
