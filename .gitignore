@@ -26,3 +26,6 @@ desktop.ini
 # 东财 Cookie（含会话令牌，不入库）
 output/.em_cache/
 
+
+# 智兔 API 文档（本地参考，不入库）
+zhitu_api_*.postman_collection.json

@@ -52,6 +52,25 @@ def _load_project_env() -> None:
 _load_project_env()
 
 
+def _parse_dps(fpfa) -> float:
+    """解析智兔分红方案 "10派12.2" -> 每股股息 1.22 元。
+
+    兼容："10派12.2" / "10送2转3派1.5" / "不分配" / "--" / None
+    无派息返回 0.0（视为不分配）。
+    """
+    import re as _re
+    if fpfa is None:
+        return 0.0
+    s = str(fpfa)
+    m = _re.search(r"派\s*([0-9]+(?:\.[0-9]+)?)", s)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1)) / 10.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class FreeScreenerBackend:
     """Tushare 兼容的免费数据后端。
 
@@ -68,6 +87,8 @@ class FreeScreenerBackend:
         self._snapshot: Optional[pd.DataFrame] = None
         self._ratio_cache: dict = {}          # 单股智兔财务指标
         self._fi_all: Optional[pd.DataFrame] = None   # 全市场财务指标
+        self._debt_all: Optional[pd.DataFrame] = None  # 全市场资产负债率
+        self._payout_all: Optional[pd.DataFrame] = None  # 全市场支付率
 
     def _akshare(self):
         if self._ak is None:
@@ -335,7 +356,19 @@ class FreeScreenerBackend:
         except Exception:                              # noqa: BLE001
             pass
 
-        # 2) 上市日期（交易所官网，与上面 merge 而非覆盖）
+        # 2) 名称 + 交易所（智兔 /hs/list/all，1 次 5227 只）
+        #    替代原先 3 次交易所官网请求（深/北/沪），无行业但含代码/名称。
+        try:
+            _lst = self._zt_get("/hs/list/all")
+            if isinstance(_lst, list) and _lst:
+                for r in _lst:
+                    _put(r.get("dm"), name=r.get("mc", ""))
+                if self.verbose:
+                    print(f"[free-backend] 名称来源: 智兔 /hs/list/all ({len(_lst)} 只)")
+        except Exception:                              # noqa: BLE001
+            pass
+
+        # 3) 上市日期（交易所官网，与上面 merge 而非覆盖）
         import akshare as ak
         from rate_limit import throttle as _thr
         try:
@@ -691,6 +724,72 @@ class FreeScreenerBackend:
                     print(f"[free-backend] {fn} 失败: {str(e)[:60]}")
         return None
 
+    # -- 全市场批量：智兔 /hicw/* （Tier1 质量门槛用）-------------------
+    def _hicw_fetch(self, kind: str, year: int = None, tries: int = 3):
+        """智兔 /hicw/{kind}/{年}/4，年份自动向前回退（年报未发布时）。
+
+        例：2026 年时 /hicw/yjbb/2025/4 为空 → 回退 2024 → 有值。
+        """
+        if year is None:
+            year = _dt.date.today().year - 1
+        for i in range(tries):
+            d = self._zt_get("/hicw/%s/%d/4" % (kind, year - i))
+            if isinstance(d, list) and d:
+                return d, year - i
+        return None, None
+
+    def debt_all(self, year: int = None) -> pd.DataFrame:
+        """全市场【资产负债率】（智兔 /hicw/cznl/{年}/4，一次 5000 只）。
+
+        实测 2024_4：5000 行，字段含 zcfzl=资产负债率(%)。
+        ★ 银行也有值（沪农商行 93.39），优于 zzshare（无此列）。
+
+        Returns: DataFrame[ts_code, debt_to_assets]
+        """
+        if getattr(self, "_debt_all", None) is not None:
+            return self._debt_all
+        d, _y = self._hicw_fetch("cznl", year)
+        out = pd.DataFrame()
+        if isinstance(d, list) and d:
+            df = pd.DataFrame(d)
+            df["ts_code"] = df["dm"].astype(str).map(self._to_ts)
+            df["debt_to_assets"] = pd.to_numeric(df.get("zcfzl"), errors="coerce")
+            out = df[["ts_code", "debt_to_assets"]].dropna(
+                subset=["debt_to_assets"]).drop_duplicates("ts_code")
+        self._debt_all = out
+        return out
+
+    def payout_all(self, year: int = None) -> pd.DataFrame:
+        """全市场【支付率 M + 归母净利 C】（智兔 /hicw/yjbb/{年}/4，一次 5000 只）。
+
+        实测 2024_4 字段：
+          fpfa  分红方案，如 "10派12.2"（每10股派12.2元）
+          mgsy  每股收益（元）
+          jlr   净利润（元，绝对值）
+
+        支付率 M = (每股股息 / 每股收益) × 100%；每股股息 = 派息额 / 10。
+        无分红方案（--/空/不分配）→ M = 0。
+
+        Returns: DataFrame[ts_code, payout_ratio, dps, net_profit]（净利单位：百万元）
+        """
+        if getattr(self, "_payout_all", None) is not None:
+            return self._payout_all
+        d, _y = self._hicw_fetch("yjbb", year)
+        out = pd.DataFrame()
+        if isinstance(d, list) and d:
+            df = pd.DataFrame(d)
+            df["ts_code"] = df["dm"].astype(str).map(self._to_ts)
+            df["dps"] = df.get("fpfa", pd.Series(dtype=object)).apply(_parse_dps)
+            eps = pd.to_numeric(df.get("mgsy"), errors="coerce")
+            df["payout_ratio"] = (df["dps"] / eps * 100).where(eps > 0)
+            # jlr 单位为【万元】-> 百万元（与框架计算口径一致）：万元 ÷ 100
+            # 实测：伊利 2025 jlr=1,156,516.65 万 = 115.65 亿 = 11,565 百万元
+            df["net_profit"] = pd.to_numeric(df.get("jlr"), errors="coerce") / 100
+            out = df[["ts_code", "payout_ratio", "dps", "net_profit"]].dropna(
+                subset=["payout_ratio"]).drop_duplicates("ts_code")
+        self._payout_all = out
+        return out
+
     # -- 单股财务指标 ---------------------------------------------------
     # -- 全市场财务指标（Tier1 前移质量门槛用）------------------------
     def fina_indicator_all(self, year: int = None) -> pd.DataFrame:
@@ -756,9 +855,16 @@ class FreeScreenerBackend:
         gm = out["grossprofit_margin"]
         out.loc[gm.notna() & ((gm > 100) | (gm < -100)), "grossprofit_margin"] = None
 
-        # 资产负债率：zzshare 该表无此列。智兔 /hs/fin/ratios/ 能给出（含银行）。
-        # 但 5000 只逐只不可行，故此项在 Tier1 不做硬过滤（交由 Tier2）。
-        out["debt_to_assets"] = None
+        # 资产负债率：zzshare 该表无此列，改由智兔 /hicw/cznl 批量补（含银行）。
+        try:
+            dz = self.debt_all(year)
+            if dz is not None and len(dz):
+                out["debt_to_assets"] = out["ts_code"].map(
+                    dz.set_index("ts_code")["debt_to_assets"])
+            else:
+                out["debt_to_assets"] = None
+        except Exception:                              # noqa: BLE001
+            out["debt_to_assets"] = None
 
         self._fi_all = out
         return out

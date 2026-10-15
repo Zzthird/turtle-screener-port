@@ -67,6 +67,19 @@ class ScreenerConfig:
     # ~0.8s 覆盖 5184 只），提前过滤可避免低质量股占用 Tier2 名额。
     # 而 R / FCF / EV/EBITDA / 底价依赖多年多表，仍留在 Tier2。
     tier1_apply_quality: bool = True
+    # 支付率上限：> 100% 视为借债/透支利润分红 → Tier1 剔除。
+    # 数据源：智兔 /hicw/yjbb 的 fpfa（分红方案）× mgsy（每股收益），全市场批量。
+    # 仅对 main 通道生效（观察通道本就无股息要求）。
+    tier1_max_payout: float = 100.0
+    # --- Tier 1: 框架因子2 粗算穿透回报率 R ---
+    # R = 归母净利 C × 支付率 M / 市值（框架原生「粗算 R」）
+    # 上游放 Tier2 因 Tushare 需逐股；免费源可批量 → 下放到 Tier1。
+    tier1_apply_R: bool = True
+    tier1_R_floor_mult: float = 0.5   # 否决门：R ≥ II × 0.5（框架规则）
+    tier1_R_rank: bool = True         # 排序是否改用 R_coarse（否则用原三因子打分）
+    # --- Tier 2: 框架粗算 R 否决门 ---
+    # 用【精算 R（AA 口径）】再确认一次；Tier1 已用粗算 R 筛过。
+    tier2_apply_R_veto: bool = False  # 默认关（Tier2 只 150 只，避免双重剔除）
     dv_weight: float = 0.4
     pe_weight: float = 0.3
     pb_weight: float = 0.3

@@ -321,6 +321,21 @@ class TushareScreener:
         cfg = self.config
         today = datetime.now()
 
+        # 门槛 II（供 6c 的粗算 R 否决门用）
+        # II = max(3.5%, Rf + 2%)，A股口径。缺失则跳过 R 门槛。
+        self._tier1_ii = None
+        if self._rf_cache is not None:
+            self._tier1_ii = max(3.5, self._rf_cache + 2.0)
+        else:
+            try:
+                _rf = self._cached_call("yc_cb", ts_code=None, curve_type="0")
+                if not _rf.empty:
+                    _rf = _rf.sort_values("trade_date", ascending=False)
+                    self._rf_cache = float(_rf.iloc[0]["yield"])
+                    self._tier1_ii = max(3.5, self._rf_cache + 2.0)
+            except Exception:                          # noqa: BLE001
+                pass
+
         # 1. Remove ST/PT/退市整理
         mask = ~df["name"].str.contains(r"\*ST|ST|PT|退市", na=False, regex=True)
         df = df[mask].copy()
@@ -379,6 +394,10 @@ class TushareScreener:
                 main_df["roe_waa"] = main_df["ts_code"].map(fi["roe_waa"])
                 main_df["grossprofit_margin"] = main_df["ts_code"].map(fi["grossprofit_margin"])
                 main_df["debt_to_assets"] = main_df["ts_code"].map(fi["debt_to_assets"])
+                # 注：银行在 /hicw/cznl 中整条缺记录（实测 601398/601166 均无），
+                # 此处不再逐股补值 —— 银行豁免阈值为 96%，实测负债率 91~93%
+                # 本就通过，补值拦不住任何一只（纯浪费 40 次请求）。
+                # 若报告需展示银行负债率，由 Tier2 的 /hs/fin/ratios 补齐。
 
                 before = len(main_df)
                 # ROE：均有门槛（年度值，由 4 季累加得到）
@@ -397,7 +416,49 @@ class TushareScreener:
                 main_df = main_df[ok].drop(columns=["_ind", "_bank"])
                 if os.environ.get("SCREENER_VERBOSE") == "1":
                     print(f"  [Tier1 质量门槛前移] {before} -> {len(main_df)} 只"
-                          f"（ROE>={cfg.min_roe}% / 毛利率>={cfg.min_gross_margin}%）")
+                          f"（ROE>={cfg.min_roe}% / 毛利率>={cfg.min_gross_margin}%"
+                          f" / 负债率<={cfg.max_debt_ratio}%）")
+
+        # 6c. 【框架因子2：粗算穿透回报率 R】
+        #     R = 归母净利 C × 支付率 M / 市值   （框架「粗算 R」定义）
+        #     否决门：R < II × 0.5 （框架因子2 粗算否决门）
+        #     ★ 上游将 R 放 Tier2 是因 Tushare 需逐股拉；
+        #       本项 C/M/市值 均由智兔批量一次拿到（~1 次请求/5000 只），
+        #       故可下放到 Tier1。
+        #     同时保留支付率上限（M <= tier1_max_payout，剔除借债分红）。
+        if cfg.tier1_apply_quality and not main_df.empty:
+            try:
+                po = self._backend.payout_all()
+            except Exception:                          # noqa: BLE001
+                po = None
+            if po is not None and len(po):
+                po_idx = po.set_index("ts_code")
+                main_df["payout_ratio"] = main_df["ts_code"].map(po_idx["payout_ratio"])
+                main_df["net_profit"] = main_df["ts_code"].map(po_idx["net_profit"])
+
+                # 粗算 R(%) = C(百万元) × M(%) / 市值(百万元)
+                mcap = main_df["total_mv"] * 10000 / 1e6      # 万元 -> 百万元
+                main_df["R_coarse"] = (
+                    main_df["net_profit"] * (main_df["payout_ratio"] / 100)
+                    / mcap * 100).where(mcap > 0)
+
+                before = len(main_df)
+                # (a) 支付率上限
+                ok = main_df["payout_ratio"].isna() | \
+                     (main_df["payout_ratio"] <= cfg.tier1_max_payout)
+                # (b) 粗算 R 否决门：R >= II×0.5（缺失值放行）
+                _ii = getattr(self, "_tier1_ii", None)
+                if _ii is not None and cfg.tier1_apply_R:
+                    ok &= main_df["R_coarse"].isna() | \
+                          (main_df["R_coarse"] >= _ii * cfg.tier1_R_floor_mult)
+                main_df = main_df[ok]
+                if os.environ.get("SCREENER_VERBOSE") == "1":
+                    _msg = (f"  [Tier1 支付率上限] {before} -> {len(main_df)} 只"
+                            f"（M<={cfg.tier1_max_payout}%")
+                    if _ii is not None and cfg.tier1_apply_R:
+                        _msg += (f" / R>={_ii * cfg.tier1_R_floor_mult:.2f}%"
+                                 f"=II×{cfg.tier1_R_floor_mult}")
+                    print(_msg + "）")
 
         # 7. Dividend yield > 0 — main channel only
         main_df = main_df[main_df["dv_ttm"].notna() & (main_df["dv_ttm"] > 0)].copy()
@@ -422,6 +483,17 @@ class TushareScreener:
         obs = df[df["channel"] == "observation"].copy()
 
         if not main.empty:
+            # ── 排序：框架因子2 粗算 R 优先 ──
+            # R_coarse 已是百分比，与门槛同量纲，无需归一化。
+            if cfg.tier1_R_rank and "R_coarse" in main.columns \
+                    and main["R_coarse"].notna().any():
+                main["tier1_score"] = main["R_coarse"].fillna(-999)
+                main = main.sort_values("tier1_score", ascending=False)
+                main = main.head(cfg.tier2_main_limit)
+                obs["tier1_score"] = 0.0
+                return pd.concat([main, obs], ignore_index=True)
+
+            # 回退：原三因子打分（股息率 / 1÷PE / 1÷PB）
             # Normalize for scoring: higher is better
             # dv_ttm: directly proportional
             # 1/PE: higher means cheaper
@@ -1176,6 +1248,35 @@ class TushareScreener:
         result["II"] = f2.get("II")
         result["Rf"] = f2.get("Rf")
         result["R_vs_II"] = f2.get("R_vs_II")
+        result["AA"] = f2.get("AA")
+        result["AA_years"] = f2.get("AA_years")
+
+        # Step 3b: 粗算 R（框架原生，Tier1 已传）
+        #   R_coarse = C × M / 市值（粗算，假设净利全可分）
+        #   R        = AA × M / 市值（精算，AA=真实可支配现金）
+        #   两者差异 > 30% → 现金质量与净利背离，需人工看。
+        result["R_refined"] = f2.get("R")          # 精算（AA 口径）
+        result["R_coarse"] = row.get("R_coarse")   # 粗算（净利口径）
+        result["payout_ratio"] = row.get("payout_ratio")
+        result["net_profit"] = row.get("net_profit")
+        _rc, _rr = result.get("R_coarse"), result.get("R_refined")
+        if _rc is not None and _rr is not None and _rr != 0:
+            result["R_divergence"] = abs(_rc - _rr) / abs(_rr) * 100
+        else:
+            result["R_divergence"] = None
+
+        # Step 3c: 框架「粗算否决门」—— R < II×0.5 直接剔除
+        #   注：Tier1 已筛过一轮，此处用【精算 R（AA 口径）】再确认。
+        #   若精算 R 低于门槛而粗算达标 → 说明 AA 远低于净利（现金质量差），
+        #   正是框架「因子2粗算→因子3精算」要敲出来的情形。
+        _ii = result.get("II")
+        _cfg = self.config
+        if (_cfg.tier2_apply_R_veto and _ii is not None
+                and result.get("R_refined") is not None
+                and result["R_refined"] < _ii * _cfg.tier1_R_floor_mult):
+            result["veto"] = "R_below_floor(AA口径)"
+            self._clear_stock_cache(ts_code)
+            return None
 
         # Step 4: Factor 4 (valuation)
         f4 = self._extract_factor4_metrics(ts_code, close, total_mv_wan)
@@ -1207,7 +1308,12 @@ class TushareScreener:
 
         # Percentile rank for each dimension
         # Higher is better: ROE, FCF yield, penetration R
-        for col in ["roe_waa", "fcf_yield", "R"]:
+        # 排序用 R_used：优先粗算 R_coarse（全市场可比），缺失时回退精算 R_refined。
+        # ⚠️ 不覆盖 R 列（R = 精算 AA 口径，与 R_coarse 并列保留给报告看）。
+        _coarse = df["R_coarse"] if "R_coarse" in df.columns else pd.Series(index=df.index, dtype=float)
+        _refined = df["R_refined"] if "R_refined" in df.columns else df.get("R")
+        df["R_used"] = _coarse.where(_coarse.notna(), _refined)
+        for col in ["roe_waa", "fcf_yield", "R_used"]:
             if col in df.columns:
                 df[f"{col}_pctile"] = df[col].rank(pct=True, na_option="bottom")
             else:
@@ -1224,7 +1330,7 @@ class TushareScreener:
         df["composite_score"] = (
             cfg.weight_roe * df["roe_waa_pctile"] +
             cfg.weight_fcf_yield * df["fcf_yield_pctile"] +
-            cfg.weight_penetration_r * df["R_pctile"] +
+            cfg.weight_penetration_r * df["R_used_pctile"] +
             cfg.weight_ev_ebitda * df["ev_ebitda_pctile"] +
             cfg.weight_floor_premium * df["floor_premium_pctile"]
         )
@@ -1313,7 +1419,8 @@ class TushareScreener:
         # Select display columns
         display_cols = [c for c in [
             "ts_code", "name", "industry", "close", "pe_ttm", "pb", "dv_ttm",
-            "roe_waa", "gross_margin", "fcf_yield", "fcf_margin", "R",
+            "roe_waa", "gross_margin", "fcf_yield", "fcf_margin",
+            "R_coarse", "R_refined", "R_divergence", "payout_ratio",
             "ev_ebitda", "floor_premium", "composite_score"
         ] if c in df.columns]
 
@@ -1426,7 +1533,8 @@ def main():
     # Display top results
     display_cols = [c for c in [
         "ts_code", "name", "industry", "composite_score", "roe_waa",
-        "fcf_yield", "fcf_margin", "R", "ev_ebitda", "floor_premium"
+        "fcf_yield", "fcf_margin", "R_coarse", "R_refined", "R_divergence",
+        "payout_ratio", "ev_ebitda", "floor_premium"
     ] if c in result.columns]
     print("\n" + result[display_cols].head(20).to_string(index=False))
 
