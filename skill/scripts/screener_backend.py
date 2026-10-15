@@ -14,9 +14,42 @@ from __future__ import annotations
 import datetime as _dt
 import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# 项目 .env 加载（避免污染系统环境变量）
+# ---------------------------------------------------------------------------
+
+def _load_project_env() -> None:
+    """从项目根/.env 读取配置到进程环境（不覆盖已有值）。
+
+    搜索顺序：cwd/.env → cwd/../.env → cwd/../../.env
+    格式：KEY=VALUE（支持 # 注释、引号）
+    """
+    for base in (Path.cwd(), Path(__file__).resolve().parent.parent,
+                 Path(__file__).resolve().parent.parent.parent):
+        env = base / ".env"
+        if not env.exists():
+            continue
+        try:
+            for line in env.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip("'\"")
+                if k and v and k not in os.environ:
+                    os.environ[k] = v
+            return
+        except Exception:                             # noqa: BLE001
+            continue
+
+
+_load_project_env()
 
 
 class FreeScreenerBackend:
