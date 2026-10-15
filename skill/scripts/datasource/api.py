@@ -47,7 +47,14 @@ def get(
 def _key_of(rec: Record, dataset: str) -> Optional[str]:
     from .schema import get_dataset
     ds = get_dataset(dataset)
-    return rec.get(ds.key_field).period
+    v = rec.get(ds.key_field)
+    if v.period:
+        return v.period
+    # 回退：任一字段带 period 即可
+    for val in rec.values.values():
+        if val.period:
+            return val.period
+    return None
 
 
 def compare(
@@ -96,7 +103,7 @@ def compare(
                 buckets.setdefault((period, spec.key), {})[s] = mm
 
     rows: list[dict] = []
-    for (period, field), vals in sorted(buckets.items()):
+    for (period, field), vals in sorted(buckets.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
         nums = [v for v in vals.values() if v is not None]
         if not nums:
             continue
@@ -112,9 +119,9 @@ def compare(
     return rows
 
 
-def crosscheck(dataset: str, code: str, **kwargs) -> str:
+def crosscheck(dataset: str, code: str, sources: Optional[list[str]] = None, **kwargs) -> str:
     """对比并返回 Markdown 表格（人可读）。"""
-    rows = compare(dataset, code, **kwargs)
+    rows = compare(dataset, code, sources, **kwargs)
     if not rows:
         return f"# {dataset} 多源对比 @ {code}\n\n无共同可比数据。\n"
 

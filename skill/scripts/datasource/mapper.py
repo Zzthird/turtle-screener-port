@@ -62,6 +62,20 @@ def map_record(
     now = _dt.datetime.now().isoformat(timespec="seconds")
     values: dict[str, Value] = {}
 
+    # 期间：优先取主键字段的原生名，回退到 end_date / statDate
+    period = None
+    for f in dataset.fields:
+        if f.key == dataset.key_field:
+            sk = f.native(source)
+            if sk and raw.get(sk) is not None:
+                period = str(raw.get(sk))
+            break
+    if period is None:
+        for alt in ("end_date", "statDate", "trade_date", "date"):
+            if raw.get(alt) is not None:
+                period = str(raw.get(alt))
+                break
+
     for spec in dataset.fields:
         src_key = spec.native(source)
         if not src_key:
@@ -73,16 +87,6 @@ def map_record(
 
         num = _coerce(raw.get(src_key), spec)
         note = None if num is not None else f"{source}.{src_key} 返回空值"
-
-        # 期间：从主键字段取
-        period = None
-        key_src = None
-        for f in dataset.fields:
-            if f.key == dataset.key_field:
-                key_src = f.native(source)
-                break
-        if key_src and raw.get(key_src) is not None:
-            period = str(raw.get(key_src))
 
         values[spec.key] = Value(
             num,

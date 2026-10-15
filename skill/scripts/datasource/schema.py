@@ -109,70 +109,78 @@ class FieldSpec:
 
 
 # ============ 利润表 (income) ============
+# zzshare 实测字段名来自 adapters/zzshare_fields.py（与 Tushare 完全不同）
 INCOME_FIELDS: list[FieldSpec] = [
-    FieldSpec("营业收入",   "百万元", "revenue",                True,  "revenue"),
-    FieldSpec("营业成本",   "百万元", "oper_cost",              True,  "oper_cost"),
-    FieldSpec("研发费用",   "百万元", "rd_exp",                 False, "rd_exp"),
-    FieldSpec("销售费用",   "百万元", "sell_exp",               False, "sell_exp"),
-    FieldSpec("管理费用",   "百万元", "admin_exp",              False, "admin_exp"),
-    FieldSpec("财务费用",   "百万元", "finance_exp",            False, "finance_exp"),
-    FieldSpec("经营利润",   "百万元", "operate_profit",         False, "operate_profit"),
-    FieldSpec("利润总额",   "百万元", "total_profit",           False, "total_profit"),
-    FieldSpec("所得税",     "百万元", "income_tax",             True,  "income_tax"),
-    FieldSpec("净利润",     "百万元", "n_income",               False, "n_income"),
-    FieldSpec("归母净利润", "百万元", "n_income_attr_p",        True,  "n_income_attr_p"),
-    FieldSpec("少数股东损益","百万元","minority_gain",          True,  "minority_gain"),
-    FieldSpec("扣非归母净利润","百万元","profit_dedt",          False, "profit_dedt"),
-    FieldSpec("基本EPS",    "元/股",  "basic_eps",              False, "basic_eps"),
+    FieldSpec("营业收入",   "元", "revenue",            True,  "revenue",         "operating_revenue"),
+    FieldSpec("营业成本",   "元", "oper_cost",          True,  "oper_cost",       "operating_cost"),
+    FieldSpec("研发费用",   "元", "rd_exp",             False, "rd_exp",          "research_expense"),
+    FieldSpec("销售费用",   "元", "sell_exp",           False, "sell_exp",        "sale_expense"),
+    FieldSpec("管理费用",   "元", "admin_exp",          False, "admin_exp",       "management_expense"),
+    FieldSpec("财务费用",   "元", "finance_exp",        False, "finance_exp",     "financial_expense"),
+    FieldSpec("经营利润",   "元", "operate_profit",     False, "operate_profit",  "operating_profit"),
+    FieldSpec("利润总额",   "元", "total_profit",       False, "total_profit",    "total_profit"),
+    FieldSpec("所得税",     "元", "income_tax",         True,  "income_tax",      "income_tax"),
+    FieldSpec("净利润",     "元", "n_income",           False, "n_income",        "net_profit"),
+    FieldSpec("归母净利润", "元", "n_income_attr_p",    True,  "n_income_attr_p", "np_parent_company_owners"),
+    FieldSpec("少数股东损益","元","minority_gain",      True,  "minority_gain",   "minority_interest"),
+    FieldSpec("扣非归母净利润","元","profit_dedt",      False, "profit_dedt",     "deduct_parent_net_profit"),
+    FieldSpec("基本EPS",    "元/股",  "basic_eps",          False, "basic_eps",       "eps"),
 ]
 
 # ============ 资产负债表 (balancesheet) ============
 BALANCE_FIELDS: list[FieldSpec] = [
-    FieldSpec("货币资金",   "百万元", "money_cap",              True,  "money_cap"),
-    FieldSpec("交易性金融资产","百万元","trad_asset",           False, "trad_asset"),
-    FieldSpec("应收账款",   "百万元", "accounts_receiv",        True,  "accounts_receiv"),
-    FieldSpec("存货",       "百万元", "inventories",            False, "inventories"),
-    FieldSpec("合同负债",   "百万元", "contract_liab",          True,  "contract_liab"),
-    FieldSpec("应付账款",   "百万元", "acct_payable",           True,  "acct_payable"),
-    FieldSpec("商誉",       "百万元", "goodwill",               False, "goodwill"),
-    FieldSpec("递延所得税资产","百万元","defer_tax_assets",     False, "defer_tax_assets"),
-    FieldSpec("递延所得税负债","百万元","defer_tax_liab",       False, "defer_tax_liab"),
-    FieldSpec("总资产",     "百万元", "total_assets",           True,  "total_assets"),
-    FieldSpec("总负债",     "百万元", "total_liab",             True,  "total_liab"),
-    FieldSpec("归母权益",   "百万元", "total_hldr_eqy_exc_min_int", True, "total_hldr_eqy_exc_min_int"),
-    FieldSpec("总股本",     "股",     "total_share",            True,  "total_share"),
+    FieldSpec("货币资金",   "元", "money_cap",          True,  "money_cap",       "cash_equivalents"),
+    FieldSpec("交易性金融资产","元","trad_asset",       False, "trad_asset",      "trading_financial_assets"),
+    FieldSpec("应收账款",   "元", "accounts_receiv",    True,  "accounts_receiv", "accounts_receivable"),
+    FieldSpec("存货",       "元", "inventories",        False, "inventories",     "inventory"),
+    FieldSpec("合同负债",   "元", "contract_liab",      True,  "contract_liab",   "contract_liabilities"),
+    FieldSpec("应付账款",   "元", "acct_payable",       True,  "acct_payable",    "accounts_payable"),
+    FieldSpec("商誉",       "元", "goodwill",           False, "goodwill",        "goodwill"),
+    FieldSpec("递延所得税资产","元","defer_tax_assets", False, "defer_tax_assets","deferred_tax_assets"),
+    FieldSpec("递延所得税负债","元","defer_tax_liab",   False, "defer_tax_liab",  "deferred_tax_liabilities"),
+    FieldSpec("总资产",     "元", "total_assets",       True,  "total_assets",    "total_assets"),
+    FieldSpec("总负债",     "元", "total_liab",         True,  "total_liab",      "total_liability"),
+    FieldSpec("归母权益",   "元", "total_hldr_eqy_exc_min_int", True, "total_hldr_eqy_exc_min_int", "owners_equity_including_minority_interest"),
+    FieldSpec("总股本",     "股",     "total_share",        True,  "total_share",     "capitalization"),
 ]
 
 # ============ 现金流量表 (cashflow) ============
 CASHFLOW_FIELDS: list[FieldSpec] = [
-    FieldSpec("经营活动现金流", "百万元", "n_cashflow_act",           True,  "n_cashflow_act"),
-    FieldSpec("资本开支",       "百万元", "c_pay_acq_const_fiolta",    True,  "c_pay_acq_const_fiolta"),
-    FieldSpec("折旧摊销_固定资产","百万元","depr_fa_coga_dpba",       True,  "depr_fa_coga_dpba"),
-    FieldSpec("摊销_无形资产",  "百万元", "amort_intang_assets",       True,  "amort_intang_assets"),
-    FieldSpec("摊销_长期待摊",  "百万元", "lt_amort_deferred_exp",     True,  "lt_amort_deferred_exp"),
-    FieldSpec("已付股息",       "百万元", "c_pay_dist_dpcp_int_exp",   True,  "c_pay_dist_dpcp_int_exp"),
-    FieldSpec("支付给职工现金", "百万元", "c_pay_to_staff",            False, "c_pay_to_staff"),
+    FieldSpec("经营活动现金流", "元", "n_cashflow_act",           True,  "n_cashflow_act",           "net_operate_cash_flow"),
+    FieldSpec("资本开支",       "元", "c_pay_acq_const_fiolta",    True,  "c_pay_acq_const_fiolta",    "buy_construct_long_term_assets"),
+    FieldSpec("折旧摊销_固定资产","元","depr_fa_coga_dpba",       True,  "depr_fa_coga_dpba",        "depr_fa_coga_dpba"),
+    FieldSpec("摊销_无形资产",  "元", "amort_intang_assets",       True,  "amort_intang_assets",      "amort_intang_assets"),
+    FieldSpec("摊销_长期待摊",  "元", "lt_amort_deferred_exp",     True,  "lt_amort_deferred_exp",    "lt_amort_deferred_exp"),
+    FieldSpec("已付股息",       "元", "c_pay_dist_dpcp_int_exp",   True,  "c_pay_dist_dpcp_int_exp",  "cash_dividend_internal"),
+    FieldSpec("支付给职工现金", "元", "c_pay_to_staff",            False, "c_pay_to_staff",           None),
 ]
 
 # ============ 财务指标 (fina_indicator) ============
 INDICATOR_FIELDS: list[FieldSpec] = [
-    FieldSpec("加权ROE",    "pct", "roe_waa",         True,  "roe_waa"),
-    FieldSpec("毛利率",     "pct", "grossprofit_margin", False, "grossprofit_margin"),
-    FieldSpec("净利率",     "pct", "netprofit_margin", False, "netprofit_margin"),
-    FieldSpec("每股净资产", "元/股","bps",             False, "bps"),
-    FieldSpec("资产负债率", "pct", "debt_to_assets",  False, "debt_to_assets"),
+    FieldSpec("加权ROE",    "pct", "roe_waa",         True,  "roe_waa",         "roe"),
+    FieldSpec("毛利率",     "pct", "grossprofit_margin", False, "grossprofit_margin", "gross_profit_margin"),
+    FieldSpec("净利率",     "pct", "netprofit_margin", False, "netprofit_margin", "net_profit_margin"),
+    FieldSpec("每股净资产", "元/股","bps",             False, "bps",             None),
+    FieldSpec("资产负债率", "pct", "debt_to_assets",  False, "debt_to_assets",  None),
 ]
 
 # ============ 每日指标 (daily_basic) ============
 DAILY_BASIC_FIELDS: list[FieldSpec] = [
-    FieldSpec("收盘价",   "元",   "close",      True,  "close"),
-    FieldSpec("总市值",   "元",   "total_mv",   True,  "total_mv"),
-    FieldSpec("流通市值", "元",   "circ_mv",    False, "circ_mv"),
-    FieldSpec("PE_TTM",   "pct",  "pe_ttm",     True,  "pe_ttm"),
-    FieldSpec("PB",       "pct",  "pb",         False, "pb"),
-    FieldSpec("股息率TTM","pct",  "dv_ttm",     False, "dv_ttm"),
-    FieldSpec("总股本",   "股",   "total_share", True, "total_share"),
+    FieldSpec("收盘价",   "元",   "close",      True,  "close",      None),
+    FieldSpec("总市值",   "元",   "total_mv",   True,  "total_mv",   "market_cap"),
+    FieldSpec("流通市值", "元",   "circ_mv",    False, "circ_mv",    "circulating_market_cap"),
+    FieldSpec("PE_TTM",   "pct",  "pe_ttm",     True,  "pe_ttm",     "pe_ratio"),
+    FieldSpec("PB",       "pct",  "pb",         False, "pb",         "pb_ratio"),
+    FieldSpec("股息率TTM","pct",  "dv_ttm",     False, "dv_ttm",     None),
+    FieldSpec("总股本",   "股",   "total_share", True, "total_share","capitalization"),
 ]
+
+# ⚠️ 单位差异提醒（实测 2026-10）:
+#   zzshare 财报 : 元        (实测 600887 单季营收 26,660,376,531.26 = 266.6 亿)
+#   zzshare 估值 : 亿元 / 万股 (market_cap=1834.67 亿, capitalization=636596 万股)
+#   Tushare 财报 : 元        (官方口径)
+#   本 schema 统一标 "元"，由 Value.to_yi()/to_mm() 负责换算
+#   适配器层需把 zzshare 估值表的亿元转成元（×1e8）
 
 # ============ 行情 (daily / weekly) ============
 PRICE_FIELDS: list[FieldSpec] = [
@@ -234,9 +242,9 @@ AUDIT_FIELDS: list[FieldSpec] = [
 MAINBZ_FIELDS: list[FieldSpec] = [
     FieldSpec("报告期",   "pct",  "end_date",  True, "end_date"),
     FieldSpec("业务项目", "pct",  "bz_item",   True, "bz_item"),
-    FieldSpec("营业收入", "百万元","bz_sales",  True, "bz_sales"),
-    FieldSpec("营业成本", "百万元","bz_cost",   True, "bz_cost"),
-    FieldSpec("营业利润", "百万元","bz_profit", True, "bz_profit"),
+    FieldSpec("营业收入", "元","bz_sales",  True, "bz_sales"),
+    FieldSpec("营业成本", "元","bz_cost",   True, "bz_cost"),
+    FieldSpec("营业利润", "元","bz_profit", True, "bz_profit"),
 ]
 
 # ============ 无风险利率 (yc_cb) ============
@@ -339,6 +347,9 @@ class Result:
     fetched_at: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
 
+    def __getitem__(self, idx: int) -> Record:
+        return self.records[idx]
+
     def __len__(self) -> int:
         return len(self.records)
 
@@ -354,3 +365,4 @@ class Result:
                 if r.get(k).missing:
                     missing.add(k)
         return sorted(missing)
+
