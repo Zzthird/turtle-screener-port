@@ -55,10 +55,15 @@ def map_record(
     source: SourceName,
     *,
     currency: str = "CNY",
+    overrides: Optional[dict[str, str]] = None,
 ) -> Record:
-    """把一行原始数据映射为统一 schema 的 Record。"""
+    """把一行原始数据映射为统一 schema 的 Record。
+
+    overrides: {业务名: 该源实际字段名}，用于运行期覆盖（如 AkShare 双后端）。
+    """
     import datetime as _dt
 
+    overrides = overrides or {}
     now = _dt.datetime.now().isoformat(timespec="seconds")
     values: dict[str, Value] = {}
 
@@ -77,7 +82,7 @@ def map_record(
                 break
 
     for spec in dataset.fields:
-        src_key = spec.native(source)
+        src_key = overrides.get(spec.key) or spec.native(source)
         if not src_key:
             values[spec.key] = Value(
                 None, unit=spec.unit, currency=currency, source=source,
@@ -107,5 +112,7 @@ def map_records(
     source: SourceName,
     *,
     currency: str = "CNY",
+    overrides: Optional[dict[str, str]] = None,
 ) -> list[Record]:
-    return [map_record(r, dataset, source, currency=currency) for r in (raw_rows or [])]
+    return [map_record(r, dataset, source, currency=currency, overrides=overrides)
+            for r in (raw_rows or [])]

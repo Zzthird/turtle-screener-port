@@ -40,6 +40,13 @@ class DataSource(abc.ABC):
     ) -> list[dict]:
         """取原始数据。返回 [{源字段名: 值}]，字段名是**该源的原生名**。"""
 
+    def field_overrides(self, dataset_name: str, rows: list[dict]) -> dict[str, str]:
+        """可选：根据实际返回行动态覆盖字段映射（业务名 -> 该源字段名）。
+
+        用例：AkShare 现金流量表走东财源时列名是英文，走新浪源时是中文。
+        """
+        return {}
+
     def fetch_dataset(self, dataset_name: str, code: str, **kwargs) -> Result:
         """取数据集并按统一 schema 映射。业务代码用这个。"""
         from .schema import get_dataset
@@ -53,7 +60,8 @@ class DataSource(abc.ABC):
             raise DataSourceError(f"{self.name} 不支持美股（{code}）")
 
         raw = self.fetch(ds.tushare_api, code, **kwargs)
-        records = map_records(raw, ds, self.name)
+        overrides = self.field_overrides(dataset_name, raw)
+        records = map_records(raw, ds, self.name, overrides=overrides)
         warnings: list[str] = []
         if not records:
             warnings.append(f"{self.name} 返回空数据（{dataset_name} @ {code}）")
