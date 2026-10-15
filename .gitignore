@@ -10,9 +10,11 @@ venv/
 .env
 *.token
 
-# 输出与缓存
+# 输出与缓存（样本报告豁免）
 output/*
 !output/.gitkeep
+!output/_samples/
+!output/_samples/**
 .cache/
 *.log
 
