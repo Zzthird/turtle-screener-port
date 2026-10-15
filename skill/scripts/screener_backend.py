@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import time
 from typing import Optional
 
@@ -62,25 +63,27 @@ class FreeScreenerBackend:
                 self._snapshot = cached
                 return cached
 
-        df = self._fetch_em_push()
+        df = self._fetch_zzshare()          # 主源：一次拿全市场估值（稳定，无风控）
         if df is None or not len(df):
-            df = self._fetch_akshare_spot()
+            df = self._fetch_em_push()      # 备源：东财 push2delay（含股息率）
         if df is None or not len(df):
-            raise RuntimeError("全市场快照获取失败（东财 push2 子域/新浪均不可用；"
-                               "可能被限流，建议等几分钟或设置 SCREENER_VERBOSE=1 查看详情）")
+            df = self._fetch_akshare_spot() # 降级：新浪（仅有价格）
+        if df is None or not len(df):
+            raise RuntimeError("全市场快照获取失败（zzshare/东财/新浪均不可用）")
 
         m = pd.DataFrame()
+        m["ts_code"] = df.get("ts_code", pd.Series(dtype=str)).astype(str)
         m["name"] = df.get("name", pd.Series(dtype=str)).astype(str)
         m["close"] = pd.to_numeric(df.get("close"), errors="coerce")
         m["pe_ttm"] = pd.to_numeric(df.get("pe_ttm"), errors="coerce")
         m["pb"] = pd.to_numeric(df.get("pb"), errors="coerce")
         m["turnover_rate"] = pd.to_numeric(df.get("turnover_rate"), errors="coerce")
-        # 东财 f20/f21 单位：元 -> Tushare 用万元
+        # 市值源单位差异：东财(元) / zzshare(已转元) —— 统一为【万元】
         m["total_mv"] = pd.to_numeric(df.get("total_mv"), errors="coerce") / 1e4
         m["circ_mv"] = pd.to_numeric(df.get("circ_mv"), errors="coerce") / 1e4
-        m["ts_code"] = df.get("ts_code", pd.Series(dtype=str)).astype(str)
+        m["dv_ttm"] = pd.to_numeric(df.get("dv_ttm"), errors="coerce")
         today = _dt.datetime.now().strftime("%Y%m%d")
-        m["trade_date"] = today
+        m["trade_date"] = df.get("trade_date", today)
         m["industry"] = ""
         m["area"] = ""
         m["market"] = ""
@@ -129,6 +132,125 @@ class FreeScreenerBackend:
             return c + ".SZ"
         return c
 
+    def _fetch_zzshare(self) -> Optional[pd.DataFrame]:
+        """zzshare finance_valuation —— 一次返回全市场估值（5226 行）。
+
+        字段: code, pe_ratio, pb_ratio, market_cap(亿元), capitalization(万股),
+              circulation... , turnover_ratio, ps_ratio, pcf_ratio
+        实测（2026-10）：无需 Cookie/代理，稳定可用。
+        缺股息率（由东财源或本地计算补充）。
+        """
+        try:
+            from zzshare.client import DataApi
+        except ImportError:
+            return None
+        try:
+            api = DataApi()
+            # 找最近有数据的交易日（往前找 5 天）
+            df = None
+            today = _dt.date.today()
+            for i in range(5):
+                d = (today - _dt.timedelta(days=i)).strftime("%Y-%m-%d")
+                try:
+                    t = api.finance_valuation(d)
+                except Exception:                     # noqa: BLE001
+                    continue
+                if t is not None and len(t):
+                    df = t
+                    break
+            if df is None or not len(df):
+                return None
+
+            out = pd.DataFrame()
+            out["ts_code"] = df["code"].astype(str)
+            out["pe_ttm"] = pd.to_numeric(df.get("pe_ratio"), errors="coerce")
+            out["pb"] = pd.to_numeric(df.get("pb_ratio"), errors="coerce")
+            # 市值：zzshare 为【亿元】 -> 转元（与其他源一致）
+            out["total_mv"] = pd.to_numeric(df.get("market_cap"), errors="coerce") * 1e8
+            out["circ_mv"] = pd.to_numeric(df.get("circulating_market_cap"), errors="coerce") * 1e8
+            out["turnover_rate"] = pd.to_numeric(df.get("turnover_ratio"), errors="coerce")
+            # 价格 = 总市值 / 总股本（万股 -> 股）
+            cap_wan = pd.to_numeric(df.get("capitalization"), errors="coerce")
+            out["close"] = out["total_mv"] / (cap_wan * 1e4)
+            out["dv_ttm"] = None
+            out["name"] = ""
+            out["trade_date"] = str(df.get("trade_date", pd.Series([""]))[0])[:10].replace("-", "")
+
+            # 补名称：zzshare 无 name，用 AkShare 股票列表（一次调用 + 缓存）
+            try:
+                ak = self._akshare()
+                nm = ak.stock_info_a_code_name()   # 列: code, name
+                if nm is not None and len(nm):
+                    nmap = dict(zip(nm.iloc[:, 0].astype(str), nm.iloc[:, 1].astype(str)))
+                    out["name"] = out["ts_code"].map(
+                        lambda c: nmap.get(str(c).split(".")[0], ""))
+            except Exception:                     # noqa: BLE001
+                pass
+
+            # 补股息率：优先智兔（全市场一次），其次东财备源
+            if os.environ.get("SCREENER_ENRICH_DV", "1") != "0":
+                try:
+                    zt = self._fetch_zhitu_dividend()
+                    if zt is not None and len(zt):
+                        dv = zt.set_index("ts_code")["dv_ttm"]
+                        out["dv_ttm"] = out["ts_code"].map(dv)
+                except Exception:                     # noqa: BLE001
+                    pass
+                if out["dv_ttm"].notna().sum() == 0:
+                    try:
+                        em = self._fetch_em_push()
+                        if em is not None and len(em) and "dv_ttm" in em.columns:
+                            dv = em.set_index("ts_code")["dv_ttm"]
+                            out["dv_ttm"] = out["ts_code"].map(dv)
+                            nms = em.set_index("ts_code")["name"]
+                            out["name"] = out["name"].where(out["name"].astype(bool),
+                                                             out["ts_code"].map(nms))
+                    except Exception:                 # noqa: BLE001
+                        pass
+
+            if self.verbose:
+                print(f"[free-backend] 快照来源: zzshare ({len(out)} 行)")
+            return out
+        except Exception as e:                        # noqa: BLE001
+            if self.verbose:
+                print(f"[free-backend] zzshare 失败: {str(e)[:60]}")
+            return None
+
+    def _fetch_zhitu_dividend(self) -> Optional[pd.DataFrame]:
+        """智兔数服 历史累计分红 —— 一次返回全市场【年均股息率】。
+
+        端点: https://api.zhituapi.com/hitc/lsfh?token=XXX
+        字段: dm(代码) mc(名称) pergx(年均股息%) totalgx(累计股息%) count(分红次数)
+        实测: 500KB+ 全市场；免费 token 可用（体验版 1000 次/分钟）
+        """
+        token = os.environ.get("ZHITU_TOKEN", "ZHITU_TOKEN_LIMIT_TEST")
+        import requests
+        from rate_limit import make_session
+        s = make_session(force_proxy=False)
+        s.headers.update({"User-Agent": "Mozilla/5.0 Chrome/131"})
+        try:
+            r = s.get("https://api.zhituapi.com/hitc/lsfh",
+                      params={"token": token}, timeout=30)
+            if r.status_code != 200:
+                if self.verbose:
+                    print(f"[free-backend] 智兔分红 HTTP {r.status_code}")
+                return None
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                return None
+            out = pd.DataFrame(data)
+            # dm 为 6 位代码，补后缀
+            out["ts_code"] = out["dm"].astype(str).map(self._to_ts)
+            out = out.rename(columns={"pergx": "dv_ttm"})
+            out["dv_ttm"] = pd.to_numeric(out["dv_ttm"], errors="coerce")
+            if self.verbose:
+                print(f"[free-backend] 股息率来源: 智兔 lsfh ({len(out)} 行)")
+            return out[["ts_code", "dv_ttm"]]
+        except Exception as e:                        # noqa: BLE001
+            if self.verbose:
+                print(f"[free-backend] 智兔分红失败: {str(e)[:60]}")
+            return None
+
     def _fetch_em_push(self) -> Optional[pd.DataFrame]:
         """东财 push2 子域名全市场快照（带限流保护）。
 
@@ -162,9 +284,11 @@ class FreeScreenerBackend:
 
         def fetch_page(host: str, pn: int) -> Optional[dict]:
             throttle(host)
-            # 最小参数集（实测：多带 po/np/fltt/invt/fid 易触发 502）
+            # np=1 是【分页开关】，缺失时服务器忽略 pn（永远返回首页）
+            # 其他参数（po/fltt/invt/fid）不需要，保持最小集减少 502
             r = s.get("https://%s/api/qt/clist/get" % host,
-                      params={"pn": pn, "pz": 200, "fs": fs, "fields": fields},
+                      params={"pn": pn, "pz": 200, "np": 1,
+                              "fs": fs, "fields": fields},
                       timeout=25)
             # 服务端可能返回非 JSON（风控页/网关错误）
             try:
