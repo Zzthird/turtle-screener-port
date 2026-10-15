@@ -43,10 +43,11 @@ class Value:
     source: Optional[SourceName] = None
     fetched_at: Optional[str] = None
     note: Optional[str] = None            # 缺失原因等
+    text: Optional[str] = None            # 文本类字段的值（股东名/进度等）
 
     @property
     def missing(self) -> bool:
-        return self.value is None
+        return self.value is None and self.text is None
 
     def to_yi(self) -> Optional[float]:
         """转亿元（正文展示口径）。"""
@@ -73,8 +74,10 @@ class Value:
         return None
 
     def __repr__(self) -> str:
-        if self.missing:
+        if self.value is None and self.text is None:
             return f"Value(MISSING, note={self.note!r})"
+        if self.value is None:
+            return f"Value({self.text!r})"
         return f"Value({self.value:,.2f} {self.unit} {self.currency})"
 
 
@@ -97,6 +100,7 @@ class FieldSpec:
     tushare: Optional[str] = None
     zzshare: Optional[str] = None
     akshare: Optional[str] = None
+    kind: str = "num"           # "num" 数值 | "str" 文本 | "date" 日期
 
     def native(self, source: str) -> Optional[str]:
         """返回该源的原生字段名。zzshare 兼容 Tushare，未显式指定时回退。"""
@@ -314,6 +318,37 @@ def get_dataset(name: str) -> Dataset:
     if name not in DATASETS:
         raise KeyError(f"未知数据集 {name!r}；可用：{list(DATASETS)}")
     return DATASETS[name]
+
+
+# 文本类字段（不参与数值计算，仅标识/展示）
+STRING_FIELDS: set[str] = {
+    # 标识
+    "代码", "名称", "行业", "地区", "市场",
+    # 股东
+    "股东名", "股份类型", "增减",
+    # 分红/回购
+    "分红进度", "回购进度", "业务项目",
+    # 审计
+    "审计结果", "审计机构",
+    # 质押
+    "所属行业",
+}
+
+
+def is_string_field(key: str) -> bool:
+    return key in STRING_FIELDS
+
+
+# 补充 AkShare 列名（单独文件维护，避免本文件过长）
+from . import akshare_columns  # noqa: E402
+
+AKSHARE_FIELD_COUNT = akshare_columns.apply()
+
+# 标记文本类字段
+for _ds in DATASETS.values():
+    for _f in _ds.fields:
+        if _f.key in STRING_FIELDS:
+            object.__setattr__(_f, "kind", "str")
 
 
 # ---------------------------------------------------------------------------

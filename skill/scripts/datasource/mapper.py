@@ -34,7 +34,9 @@ def to_business_name(dataset: Dataset, source_key: str, source: SourceName) -> O
 
 
 def _coerce(raw: Any, spec: FieldSpec) -> Optional[float]:
-    """把原始值转 float。空值/非法值返回 None。"""
+    """把原始值转 float。空值/非法值/文本类字段返回 None。"""
+    if getattr(spec, "kind", "num") == "str":
+        return None                     # 文本字段不参与数值
     if raw is None:
         return None
     if isinstance(raw, (int, float)):
@@ -67,22 +69,33 @@ def map_record(
     now = _dt.datetime.now().isoformat(timespec="seconds")
     values: dict[str, Value] = {}
 
-    # 期间：优先取主键字段的原生名，回退到 end_date / statDate
+    # 期间：优先取主键字段的原生名（含 override），回退到常见日期列
     period = None
-    for f in dataset.fields:
-        if f.key == dataset.key_field:
-            sk = f.native(source)
-            if sk and raw.get(sk) is not None:
-                period = str(raw.get(sk))
-            break
+    key_field_name = dataset.key_field
+    sk = overrides.get(key_field_name)
+    if sk is None:
+        for f in dataset.fields:
+            if f.key == key_field_name:
+                sk = f.native(source)
+                break
+    if sk and raw.get(sk) is not None:
+        period = str(raw.get(sk))
     if period is None:
-        for alt in ("end_date", "statDate", "trade_date", "date"):
+        for alt in ("end_date", "statDate", "trade_date", "date", "日期",
+                    "公告日期", "交易日期", "报告日"):
             if raw.get(alt) is not None:
                 period = str(raw.get(alt))
                 break
 
     for spec in dataset.fields:
         src_key = overrides.get(spec.key) or spec.native(source)
+        if spec.key == dataset.key_field and period is not None:
+            # 主键字段：值不参与计算，只携带 period
+            values[spec.key] = Value(
+                1.0, unit=spec.unit, currency=currency, period=period,
+                source=source, fetched_at=now, note="period-key",
+            )
+            continue
         if not src_key:
             values[spec.key] = Value(
                 None, unit=spec.unit, currency=currency, source=source,
@@ -91,7 +104,14 @@ def map_record(
             continue
 
         num = _coerce(raw.get(src_key), spec)
-        note = None if num is not None else f"{source}.{src_key} 返回空值"
+        txt = None
+        note = None
+        if getattr(spec, "kind", "num") == "str":
+            raw_v = raw.get(src_key)
+            txt = None if raw_v is None else str(raw_v).strip() or None
+            note = None if txt else f"{source}.{src_key} 返回空值"
+        else:
+            note = None if num is not None else f"{source}.{src_key} 返回空值"
 
         values[spec.key] = Value(
             num,
@@ -101,6 +121,7 @@ def map_record(
             source=source,
             fetched_at=now,
             note=note,
+            text=txt,
         )
 
     return Record(values=values, source=source)
