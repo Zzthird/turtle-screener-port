@@ -172,7 +172,7 @@ INDICATOR_FIELDS: list[FieldSpec] = [
 
 # ============ 每日指标 (daily_basic) ============
 DAILY_BASIC_FIELDS: list[FieldSpec] = [
-    FieldSpec("收盘价", "元", "close", True, "close", None, None),
+    FieldSpec("收盘价", "元/股", "close", True, "close", None, None),
     FieldSpec("总市值", "元", "total_mv", True, "total_mv", "market_cap", None),
     FieldSpec("流通市值", "元", "circ_mv", False, "circ_mv", "circulating_market_cap", None),
     FieldSpec("PE_TTM", "pct", "pe_ttm", True, "pe_ttm", "pe_ratio", None),
@@ -191,12 +191,12 @@ DAILY_BASIC_FIELDS: list[FieldSpec] = [
 # ============ 行情 (daily / weekly) ============
 PRICE_FIELDS: list[FieldSpec] = [
     FieldSpec("交易日期", "pct", "trade_date", True, "trade_date"),
-    FieldSpec("开盘价",   "元",  "open",       True, "open"),
-    FieldSpec("最高价",   "元",  "high",       True, "high"),
-    FieldSpec("最低价",   "元",  "low",        True, "low"),
-    FieldSpec("收盘价",   "元",  "close",      True, "close"),
-    FieldSpec("成交量",   "手",  "vol",        False, "vol"),
-    FieldSpec("成交额",   "元",  "amount",     False, "amount"),
+    FieldSpec("开盘价",   "元/股", "open",   True, "open", None, "开盘"),
+    FieldSpec("最高价",   "元/股", "high",   True, "high", None, "最高"),
+    FieldSpec("最低价",   "元/股", "low",    True, "low", None, "最低"),
+    FieldSpec("收盘价",   "元/股", "close",  True, "close", None, "收盘"),
+    FieldSpec("成交量",   "手",   "vol",    False, "vol", None, "成交量"),
+    FieldSpec("成交额",   "元",   "amount", False, "amount", None, "成交额"),
 ]
 
 # ============ 分红 (dividend) ============

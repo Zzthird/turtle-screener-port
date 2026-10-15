@@ -161,9 +161,11 @@ def _fmt_val(v: dict) -> str:
     """把 Value dict 格式化为表格单元格。"""
     if not isinstance(v, dict):
         return "—"
-    txt = v.get("text")
-    if txt:
-        return str(txt)
+    # 主键占位（只携带 period）：显示 period，不显示占位值 1.0
+    if v.get("note") == "period-key":
+        return str(v.get("period") or v.get("text") or "—")
+    if v.get("text"):
+        return str(v["text"])
     val = v.get("value")
     if val is None:
         return "—"
@@ -416,6 +418,7 @@ def main() -> int:
     ap.add_argument("--sources", default=None, help="限定数据源，逗号分隔（默认按 router 优先级）")
     ap.add_argument("--sections", default=None, help="限定段号，逗号分隔，如 1,3,4,5")
     ap.add_argument("--list-sources", action="store_true", help="列出可用数据源后退出")
+    ap.add_argument("--no-section17", action="store_true", help="跳过 §17 衍生指标预计算")
     args = ap.parse_args()
 
     if args.list_sources:
@@ -466,6 +469,19 @@ def main() -> int:
                               source="local", rows=len(raw_sections))
         results.append(res13)
         print(f"  §13  风险检测       ✅ local（扫 {len(raw_sections)} 个数据集）")
+
+    # §17 衍生指标预计算（本地网格，供 Agent 查表选行）
+    if not args.no_section17:
+        try:
+            from derived_metrics_local import build as _build17
+            # §17 需要完整 datapack（含 §1 头部信息），重新拼一次
+            _full = build_header(code, results) + "\n".join(parts)
+            parts.append(_build17(_full))
+            results.append(SectionResult(section="17", dataset="衍生指标", ok=True,
+                                         source="local", rows=0))
+            print("  §17  衍生指标        ✅ local（网格预计算）")
+        except Exception as e:                        # noqa: BLE001
+            print(f"  §17  衍生指标        ⚠️ 跳过（{type(e).__name__}: {str(e)[:60]}）")
 
     doc = build_header(code, results) + "\n".join(parts) + build_summary(results)
 

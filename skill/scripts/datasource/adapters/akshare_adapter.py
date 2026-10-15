@@ -98,10 +98,14 @@ class AkshareAdapter(DataSource):
 
         # 行情：东财源中文列 或 腾讯源英文列
         if dataset_name in ("日线行情", "周线行情"):
-            if "收盘" in keys:
-                return dict(AF.PRICE_HIST_MAP)
-            if "close" in keys:
-                return dict(AF.PRICE_hist_EN_MAP)
+            # 腾讯源英文列
+            if "close" in keys and "open" in keys:
+                m = dict(AF.PRICE_hist_EN_MAP)
+            else:
+                m = dict(AF.PRICE_HIST_MAP)
+            # 适配器补的 trade_date 列 -> 交易日期主键
+            m["交易日期"] = "trade_date"
+            return m
 
         # 基础信息：适配器输出中文键名
         if dataset_name == "股票基础信息":
