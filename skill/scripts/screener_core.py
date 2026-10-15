@@ -362,6 +362,43 @@ class TushareScreener:
         main_df = df[main_mask].copy()
         obs_df = df[obs_mask].copy()
 
+        # 6b. 【Tier2 质量门槛前移】ROE / 毛利率 / 负债率
+        #     这三项均为硬门槛，且可用全市场批量源一次拿到（~0.8s）。
+        #     提前过滤可避免低质量股占用 Tier2 的 150 个名额。
+        #     行业阈值（银行高杠杆）与 Tier2 保持一致。
+        if cfg.tier1_apply_quality and not main_df.empty:
+            try:
+                fi = self._backend.fina_indicator_all()
+            except Exception:                          # noqa: BLE001
+                fi = None
+            if fi is not None and len(fi):
+                fi = fi.drop_duplicates("ts_code").set_index("ts_code")
+                main_df["_ind"] = main_df["industry"].fillna("").astype(str)
+                main_df["_bank"] = main_df["_ind"].apply(
+                    lambda x: any(k in x for k in cfg.bank_industries))
+                main_df["roe_waa"] = main_df["ts_code"].map(fi["roe_waa"])
+                main_df["grossprofit_margin"] = main_df["ts_code"].map(fi["grossprofit_margin"])
+                main_df["debt_to_assets"] = main_df["ts_code"].map(fi["debt_to_assets"])
+
+                before = len(main_df)
+                # ROE：均有门槛（年度值，由 4 季累加得到）
+                ok = main_df["roe_waa"].isna() | (main_df["roe_waa"] >= cfg.min_roe)
+                # 毛利率：银行为 0（不适用），其余 15%
+                gm_min = main_df["_bank"].map(
+                    lambda b: cfg.min_gross_margin_bank if b else cfg.min_gross_margin)
+                ok &= main_df["grossprofit_margin"].isna() | \
+                      (main_df["grossprofit_margin"] >= gm_min)
+                # 负债率：批量源拿不到（zzshare 无此列），交由 Tier2 判；
+                # 若已拿到则同样过滤
+                debt_max = main_df["_bank"].map(
+                    lambda b: cfg.max_debt_ratio_bank if b else cfg.max_debt_ratio)
+                ok &= main_df["debt_to_assets"].isna() | \
+                      (main_df["debt_to_assets"] <= debt_max)
+                main_df = main_df[ok].drop(columns=["_ind", "_bank"])
+                if os.environ.get("SCREENER_VERBOSE") == "1":
+                    print(f"  [Tier1 质量门槛前移] {before} -> {len(main_df)} 只"
+                          f"（ROE>={cfg.min_roe}% / 毛利率>={cfg.min_gross_margin}%）")
+
         # 7. Dividend yield > 0 — main channel only
         main_df = main_df[main_df["dv_ttm"].notna() & (main_df["dv_ttm"] > 0)].copy()
         main_df["channel"] = "main"

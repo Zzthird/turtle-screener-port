@@ -66,6 +66,8 @@ class FreeScreenerBackend:
         self.verbose = verbose
         self._ak = None
         self._snapshot: Optional[pd.DataFrame] = None
+        self._ratio_cache: dict = {}          # 单股智兔财务指标
+        self._fi_all: Optional[pd.DataFrame] = None   # 全市场财务指标
 
     def _akshare(self):
         if self._ak is None:
@@ -213,27 +215,51 @@ class FreeScreenerBackend:
     # 上市日期：交易所官网表（深/北/沪），3 次请求。
     # 结果带磁盘缓存（30 天）。
     _BI_TTL_DAYS = 30
-    _ratio_cache: dict = {}
     ZT_BASE = "https://api.zhituapi.com"
 
+    def _zt_tokens(self) -> list:
+        """智兔 token 列表（支持多个，轮换使用以免单 token 耗尽日额度）。
+
+        配置方式（.env）：
+            ZHITU_TOKEN=主 token
+            ZHITU_TOKENS=token1,token2,...   （可选，多个用逗号分隔）
+        """
+        toks = []
+        for k in ("ZHITU_TOKEN", "ZHITU_TOKENS"):
+            v = os.environ.get(k) or ""
+            for t in v.split(","):
+                t = t.strip()
+                if t and t not in toks:
+                    toks.append(t)
+        return toks
+
     def _zt_get(self, path: str, **params):
-        """调智兔 API（直连，不走代理；带重试）。"""
+        """调智兔 API（直连不走代理；多 token 轮换 + 重试）。
+
+        遇 429 / “当日请求已超限” 会换下一个 token；全部耗尽则返回 None。
+        """
         import requests
-        token = os.environ.get("ZHITU_TOKEN")
-        if not token:
+        toks = self._zt_tokens()
+        if not toks:
             return None
         from rate_limit import make_session
         sess = make_session(force_proxy=False)
         sess.headers.update({"User-Agent": "Mozilla/5.0 Chrome/131"})
-        p = {"token": token}
-        p.update(params)
         for attempt in range(3):
-            try:
-                r = sess.get(self.ZT_BASE + path, params=p, timeout=60)
-                if r.status_code == 200:
-                    return r.json()
-            except Exception:                          # noqa: BLE001
-                pass
+            for tok in toks:
+                p = {"token": tok}
+                p.update(params)
+                try:
+                    r = sess.get(self.ZT_BASE + path, params=p, timeout=60)
+                    if r.status_code == 200:
+                        txt = r.text.lstrip()
+                        if txt.startswith("[") or txt.startswith("{"):
+                            return r.json()
+                        return None
+                    if r.status_code in (429, 403):
+                        continue          # 换下一个 token
+                except Exception:                      # noqa: BLE001
+                    pass
             time.sleep(2 * (attempt + 1))
         return None
 
@@ -475,19 +501,8 @@ class FreeScreenerBackend:
         字段: dm(代码) mc(名称) pergx(年均股息%) totalgx(累计股息%) count(分红次数)
         实测: 500KB+ 全市场；免费 token 可用（体验版 1000 次/分钟）
         """
-        token = os.environ.get("ZHITU_TOKEN", "ZHITU_TOKEN_LIMIT_TEST")
-        import requests
-        from rate_limit import make_session
-        s = make_session(force_proxy=False)
-        s.headers.update({"User-Agent": "Mozilla/5.0 Chrome/131"})
+        data = self._zt_get("/hitc/lsfh")
         try:
-            r = s.get("https://api.zhituapi.com/hitc/lsfh",
-                      params={"token": token}, timeout=30)
-            if r.status_code != 200:
-                if self.verbose:
-                    print(f"[free-backend] 智兔分红 HTTP {r.status_code}")
-                return None
-            data = r.json()
             if not isinstance(data, list) or not data:
                 return None
             out = pd.DataFrame(data)
@@ -677,6 +692,77 @@ class FreeScreenerBackend:
         return None
 
     # -- 单股财务指标 ---------------------------------------------------
+    # -- 全市场财务指标（Tier1 前移质量门槛用）------------------------
+    def fina_indicator_all(self, year: int = None) -> pd.DataFrame:
+        """全市场【年度】财务指标（一次拉取）。
+
+        用于把 Tier2 的 ROE / 毛利率 / 资产负债率门槛【前移到 Tier1】：
+        这三项都是硬门槛，提前过滤可避免低质量股占用 Tier2 名额。
+
+        ⚠️ zzshare finance_indicator 的 roe 是【单季值】（实测茅台 2025q4
+        为 7.05、2023q4 为 10.08），必须**累加 4 个季度**才是年度 ROE。
+        已实测：茅台 10.93+7.47+7.76+7.05 = 33.21（年度值同为 33.21）
+                沪农商行 2.87+2.74+2.81+1.38 = 9.80（同为 9.80）
+        毛利率/净利率本身是年度值，取 q4 即可。
+
+        Returns:
+            DataFrame[ts_code, roe_waa, grossprofit_margin, netprofit_margin, end_date]
+        """
+        if getattr(self, "_fi_all", None) is not None:
+            return self._fi_all
+
+        cur_year = _dt.date.today().year
+        if year is None:
+            year = cur_year - 1          # 最近已完成年度
+
+        roe_sum: dict = {}
+        q4_df = None
+        try:
+            from zzshare.client import DataApi
+            api = DataApi(token=os.environ.get("ZZSHARE_TOKEN") or None)
+            for q in (1, 2, 3, 4):
+                try:
+                    df = api.finance_indicator("%dq%d" % (year, q))
+                except Exception:                  # noqa: BLE001
+                    continue
+                if df is None or not len(df):
+                    continue
+                codes = df["code"].astype(str)
+                vals = pd.to_numeric(df.get("roe"), errors="coerce")
+                for c, v in zip(codes, vals):
+                    if v is not None and v == v:
+                        roe_sum[c] = roe_sum.get(c, 0.0) + float(v)
+                if q == 4:
+                    q4_df = df
+        except Exception:                              # noqa: BLE001
+            q4_df = None
+
+        if q4_df is None or not len(q4_df):
+            out = pd.DataFrame()
+            self._fi_all = out
+            return out
+
+        out = pd.DataFrame({
+            "ts_code": q4_df["code"].astype(str),
+            "grossprofit_margin": pd.to_numeric(
+                q4_df.get("gross_profit_margin"), errors="coerce"),
+            "netprofit_margin": pd.to_numeric(
+                q4_df.get("net_profit_margin"), errors="coerce"),
+            "end_date": "%d1231" % year,
+        })
+        out["roe_waa"] = out["ts_code"].map(roe_sum)
+
+        # 修正明显失真的毛利率（zzshare 实测部分股票 >100%）
+        gm = out["grossprofit_margin"]
+        out.loc[gm.notna() & ((gm > 100) | (gm < -100)), "grossprofit_margin"] = None
+
+        # 资产负债率：zzshare 该表无此列。智兔 /hs/fin/ratios/ 能给出（含银行）。
+        # 但 5000 只逐只不可行，故此项在 Tier1 不做硬过滤（交由 Tier2）。
+        out["debt_to_assets"] = None
+
+        self._fi_all = out
+        return out
+
     def fina_indicator(self, ts_code: str, periods: int = 5) -> pd.DataFrame:
         """单股财务指标（近 N 年）。列对齐 Tushare 常用子集。"""
         import sys, os

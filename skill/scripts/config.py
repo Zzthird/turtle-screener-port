@@ -9,10 +9,17 @@ from typing import Optional
 
 
 def _load_env_file() -> None:
-    """Load .env file from project root if it exists."""
-    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-    env_path = os.path.normpath(env_path)
-    if not os.path.isfile(env_path):
+    """Load .env file from project root if it exists.
+
+    本文件位于 <root>/skill/scripts/config.py，故项目根为 ../../
+    （同时兼容旧的 ../ 布局）。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for rel in ("../..", ".."):
+        env_path = os.path.normpath(os.path.join(here, rel, ".env"))
+        if os.path.isfile(env_path):
+            break
+    else:
         return
     with open(env_path, encoding="utf-8") as f:
         for line in f:
@@ -25,6 +32,17 @@ def _load_env_file() -> None:
                 value = value.strip().strip("'\"")
                 if key and key not in os.environ:
                     os.environ[key] = value
+
+
+def _ensure_env() -> None:
+    """模块级自动加载 .env（幂等）。"""
+    global _ENV_LOADED
+    if not _ENV_LOADED:
+        _load_env_file()
+        _ENV_LOADED = True
+
+
+_ENV_LOADED = False
 
 
 def get_token() -> str:

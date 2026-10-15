@@ -62,6 +62,11 @@ class ScreenerConfig:
 
     # --- Tier 1: Ranking & cutoff ---
     tier2_main_limit: int = 150
+    # 把 Tier2 的质量硬门槛前移到 Tier1（ROE/毛利率/负债率）。
+    # 依据：这三项均可用全市场批量源一次拿到（zzshare finance_indicator，
+    # ~0.8s 覆盖 5184 只），提前过滤可避免低质量股占用 Tier2 名额。
+    # 而 R / FCF / EV/EBITDA / 底价依赖多年多表，仍留在 Tier2。
+    tier1_apply_quality: bool = True
     dv_weight: float = 0.4
     pe_weight: float = 0.3
     pb_weight: float = 0.3
