@@ -23,9 +23,9 @@ ROUTING: dict[str, list[str]] = {
     "1":   ["akshare", "zzshare", "tushare"],       # 基本信息
     "2":   ["akshare", "tushare"],                  # 市场行情（52周）
     "3":   ["akshare", "zzshare", "tushare"],       # 合并利润表
-    "3P":  ["tushare"],                             # 母公司利润表 ← 唯一源
+    "3P":  ["cninfo_pdf", "tushare"],              # 母公司利润表（巨潮 PDF 优先）
     "4":   ["akshare", "zzshare", "tushare"],       # 合并资产负债表
-    "4P":  ["tushare"],                             # 母公司资产负债表 ← 唯一源
+    "4P":  ["cninfo_pdf", "tushare"],              # 母公司资产负债表
     "5":   ["akshare", "tushare"],                  # 合并现金流量表（ak 字段最全）
     "6":   ["akshare", "tushare"],                  # 分红历史
     "11":  ["akshare", "tushare"],                  # 十年周线
@@ -43,7 +43,7 @@ SECTION_DATASET: dict[str, Optional[str]] = {
     "1":  "股票基础信息",
     "2":  "每日指标",
     "3":  "利润表",
-    "3P": None,                # 母公司利润表：仅 Tushare，未接入数据层
+    "3P": None,                # 母公司利润表：走 PDF 提取（_collect_parent）
     "4":  "资产负债表",
     "4P": None,                # 母公司资产负债表：同上
     "5":  "现金流量表",
@@ -80,7 +80,9 @@ SECTION_TITLE: dict[str, str] = {
 }
 
 # 降级容忍：缺失时不中止分析，仅标注可信度降低
-DEGRADABLE: set[str] = {"3P", "4P", "15", "16", "6", "9"}
+# 注：§3P/§4P 已由 cninfo_pdf 提供，不再属降级项（PDF 缺失时仍降级）
+DEGRADABLE: set[str] = {"15", "16", "6", "9"}
+PDF_FALLBACK: set[str] = {"3P", "4P"}          # 有 PDF 则可用，无则降级
 
 
 @dataclass
@@ -122,4 +124,4 @@ def title_for(section: str) -> str:
 
 
 def is_degradable(section: str) -> bool:
-    return section in DEGRADABLE
+    return section in DEGRADABLE or section in PDF_FALLBACK

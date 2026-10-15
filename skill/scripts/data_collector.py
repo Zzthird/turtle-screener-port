@@ -40,6 +40,64 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
 }
 
 
+def _collect_parent(section: str, code: str, res: SectionResult) -> tuple[SectionResult, list[dict]]:
+    """§3P / §4P：从巨潮年报 PDF 提取母公司报表。
+
+    流程：找 PDF（已有则用）→ 提取 → 校验（母公司 <= 合并）
+    """
+    num = code.split(".")[0]
+    roots = [Path(_HERE).resolve().parent.parent / "output",
+             Path.cwd() / "output",
+             Path.cwd()]
+    pdf: Path | None = None
+    for root in roots:
+        if not root.exists():
+            continue
+        for pat in (f"{num}*/{num}_*年报*.pdf", f"{num}*/*.pdf", f"*{num}*.pdf"):
+            cands = sorted(root.glob(pat), key=lambda p: p.stat().st_mtime, reverse=True)
+            if cands:
+                pdf = cands[0]
+                break
+        if pdf:
+            break
+
+    if pdf is None:
+        res.attempts.append(("cninfo", "未找到年报 PDF（先用 cninfo_downloader.py 下载）"))
+        return res, []
+
+    try:
+        from pdf_parent_extractor import extract_parent_reports, validate, to_rows
+    except ImportError as e:                        # noqa: BLE001
+        res.attempts.append(("pdf", f"模块缺失：{e}"))
+        return res, []
+
+    try:
+        reps = extract_parent_reports(str(pdf))
+    except Exception as e:                          # noqa: BLE001
+        res.attempts.append(("pdf", f"提取失败：{type(e).__name__}: {e}"))
+        return res, []
+
+    if not reps:
+        res.attempts.append(("pdf", "未找到母公司报表章节"))
+        return res, []
+
+    warns = validate(reps)
+    key = "母公司利润表" if section == "3P" else "母公司资产负债表"
+    rep = reps.get(key)
+    rows = to_rows(reps).get(key, [])
+
+    if not rows:
+        res.attempts.append(("pdf", f"{key} 提取为空"))
+        return res, []
+
+    res.dataset = key              # 供渲染层选择矩阵格式
+    res.ok = True
+    res.source = "cninfo_pdf"
+    res.rows = len(rows)
+    res.attempts.extend([("validate", w) for w in warns])
+    return res, rows
+
+
 def collect_section(section: str, code: str, sources: list[str] | None = None) -> tuple[SectionResult, list[dict]]:
     """取一个数据段，按优先级尝试各源。"""
     ds_name = dataset_for(section)
@@ -47,6 +105,9 @@ def collect_section(section: str, code: str, sources: list[str] | None = None) -
                         degradable=is_degradable(section))
 
     if ds_name is None:
+        # 母公司报表（§3P/§4P）：走 PDF 提取
+        if section in ("3P", "4P"):
+            return _collect_parent(section, code, res)
         res.attempts.append(("router", f"段 {section} 无数据集映射（需 Tushare 或本地计算）"))
         return res, []
 
@@ -122,7 +183,8 @@ def _row_period(r: dict) -> str:
 
 
 # 矩阵型渲染（字段为行、期间为列）的数据集
-MATRIX_DATASETS = {"利润表", "资产负债表", "现金流量表", "财务指标"}
+MATRIX_DATASETS = {"利润表", "资产负债表", "现金流量表", "财务指标",
+                   "母公司利润表", "母公司资产负债表", "母公司现金流量表"}
 
 
 def _render_matrix(res: SectionResult, rows: list[dict]) -> list[str]:
