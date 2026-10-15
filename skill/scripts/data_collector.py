@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import re
 import sys
 from pathlib import Path
 
@@ -223,8 +224,9 @@ LIST_DATASETS = {"十大股东", "主营业务构成", "分红", "股份回购",
 def _render_list(res: SectionResult, rows: list[dict]) -> list[str]:
     """每行一个记录，字段为列。"""
     keys = [k for k in rows[0].keys() if not k.startswith("_") and k != "报告期"]
-    priority = ["股东名", "业务项目", "公告日", "公告日期", "回购进度", "质押比例",
-                "交易日期", "曲线日期", "每股股息", "分红进度"]
+    # 关键列优先（年度必须在第一列，quality_control 依赖）
+    priority = ["年度", "报告期", "交易日期", "曲线日期", "公告日", "公告日期",
+                "股东名", "业务项目", "回购进度", "质押比例", "每股股息", "分红进度"]
     keys = [k for k in priority if k in keys] + [k for k in keys if k not in priority]
 
     out = ["| " + " | ".join(keys) + " |", "|" + "---|" * len(keys)]
@@ -248,6 +250,64 @@ def _render_keyvalue(res: SectionResult, rows: list[dict]) -> list[str]:
     if out:
         out = ["| 项目 | 数值 |", "|---|---|"] + out[:40]
     out.append("")
+    return out
+
+
+def _aggregate_dividends(rows: list[dict], all_sections: dict) -> list[dict]:
+    """§6 分红按年聚合：{年度, 总分红(百万元), 每股股息(元/股), 分红次数}。
+
+    quality_control.py 期望格式：第一列是 4 位年度，含「总分红」列（百万元）。
+    总分红 = 每股股息(元/股) × 总股本(股) / 1e6
+    """
+    shares = None
+    for r in (all_sections.get("资产负债表") or []):
+        v = r.get("总股本", {})
+        if isinstance(v, dict) and v.get("value"):
+            shares = v["value"]
+            break
+
+    agg: dict[str, dict] = {}
+    for r in rows:
+        # 年份取【公告日】的 period（适配器已用公告年推算财年），
+        # 不能用除权日——其 period 在 mapper 中会被 end_date 回退覆盖
+        yr = ""
+        for k in ("报告期", "公告日"):
+            v = r.get(k, {})
+            if isinstance(v, dict) and v.get("period"):
+                m = re.search(r"(20\d{2})", str(v["period"]))
+                if m:
+                    yr = m.group(1)
+                    break
+        # 回退：从任意字段的 period 推
+        if not yr:
+            for v in r.values():
+                if isinstance(v, dict) and v.get("period"):
+                    m = re.search(r"(20\d{2})", str(v["period"]))
+                    if m:
+                        yr = m.group(1)
+                        break
+        if not yr:
+            continue
+        dps = r.get("每股股息", {})
+        raw = dps.get("value") if isinstance(dps, dict) else None
+        if raw is None:
+            continue
+        dps_v = raw / 10.0          # ⚠️ AkShare「派息」= 每 10 股派 X 元 -> 每股权
+        slot = agg.setdefault(yr, {"总分红": 0.0, "每股股息": 0.0, "分红次数": 0})
+        slot["每股股息"] += dps_v
+        slot["分红次数"] += 1
+
+    out = []
+    for yr in sorted(agg, reverse=True):
+        s = agg[yr]
+        total_mm = (s["每股股息"] * shares / 1e6) if shares else s["每股股息"]
+        out.append({
+            "年度": {"text": yr, "value": None, "period": yr + "1231"},
+            # 已经是百万元，标 unit="百万元" 避免渲染层再除 1e6
+            "总分红": {"value": total_mm, "unit": "百万元"},
+            "每股股息": {"value": s["每股股息"], "unit": "元/股"},
+            "分红次数": {"value": float(s["分红次数"]), "unit": "pct"},
+        })
     return out
 
 
@@ -365,6 +425,9 @@ def main() -> int:
             print(f"         ↳ {res.reason()}")
         if rows and res.dataset not in ("-", None):
             raw_sections.setdefault(res.dataset, rows)
+        # §6 分红：按年聚合（quality_control 需要「年度+总分红」）
+        if sec == "6" and rows:
+            rows = _aggregate_dividends(rows, raw_sections)
         parts.append(section_markdown(sec, res, rows))
 
     # §13 本地风险检测（基于已采集数据）

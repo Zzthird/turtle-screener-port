@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from ..base import DataSource, DataSourceError, register
@@ -151,10 +152,17 @@ class AkshareAdapter(DataSource):
         if df is None or len(df) == 0:
             return []
         rows = df.to_dict("records")
-        # 用公告日期推算财年（分红通常次年派发）
+        # 财年推算：年中（1-6 月）公告的分红属【上一年度】，下半年（7-12 月）属【本年度】
+        # 实测伊利：2024-05-29 公告 = 2023 年度分红；2025-12-09 公告 = 2025 中期
         for r in rows:
-            ann = str(r.get("公告日期", ""))[:4]
-            r["__report_year__"] = str(int(ann) - 1) + "1231" if ann.isdigit() else ""
+            ann = str(r.get("公告日期", ""))[:10]
+            m = re.match(r"(\d{4})-(\d{2})", ann)
+            if m:
+                y, mo = int(m.group(1)), int(m.group(2))
+                fy = y - 1 if mo <= 6 else y
+                r["__report_year__"] = f"{fy}1231"
+            else:
+                r["__report_year__"] = ""
             r["end_date"] = r["__report_year__"]
         return rows[:limit]
 
