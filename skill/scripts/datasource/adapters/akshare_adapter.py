@@ -298,6 +298,155 @@ class AkshareAdapter(DataSource):
 
         return [out] if (close is not None or shares) else []
 
+    # -- 财务指标（比率类，不可累加）------------------------------------
+    def _fetch_fina_indicator(self, code, periods, limit, **kw) -> list[dict]:
+        """zzshare finance_indicator。
+
+        ⚠️ 实测（2026-10）：zzshare indicator 返回【单季度值】，且字段语义不同：
+          - 累加型（流量类）：roe / eps / operating_profit → 可按年求和
+          - 比率型（不可累加）：gross_profit_margin / net_profit_margin
+                                 → 取【年报期值】或年度【均值】
+        实测伊利 2024：毛利率单季 36.02/33.84/35.05/31.00，年报口径约 33.98
+                       累加会得 135.91（错）；均值得 33.98（对）
+        """
+        zapi = self._get_api()
+        start = "2015-01-01"
+        end = "2030-12-31"
+        if periods:
+            ps = sorted(str(p).replace("-", "") for p in periods)
+            start = f"{ps[0][:4]}-01-01"
+            end = f"{ps[-1][:4]}-12-31"
+        try:
+            df = zapi.finance_stock(table="indicator", code=code,
+                                    start_date=start, end_date=end)
+        except Exception as e:                        # noqa: BLE001
+            raise DataSourceError(f"zzshare finance_indicator 失败：{str(e)[:150]}") from e
+        if df is None or len(df) == 0:
+            return []
+
+        rows = df.to_dict("records")
+        # 比率型字段：取年度均值（Q1-Q4 平均）
+        RATIO_KEYS = {"gross_profit_margin", "net_profit_margin"}
+        # 累加型字段：按年求和
+        SUM_KEYS = {"roe", "eps", "operating_profit", "adjusted_profit"}
+
+        buckets: dict[str, dict] = {}
+        for r in rows:
+            sd = str(r.get("statDate", ""))
+            if len(sd) < 10:
+                continue
+            y = sd[:4]
+            b = buckets.setdefault(y, {"statDate": f"{y}-12-31", "_n": 0})
+            b["_n"] += 1
+            for k, v in r.items():
+                if k in ("statDate", "pubDate", "code"):
+                    continue
+                if not isinstance(v, (int, float)) or v != v:
+                    continue
+                if k in RATIO_KEYS:
+                    b.setdefault("_ratio_sum", {}).setdefault(k, []).append(float(v))
+                elif k in SUM_KEYS:
+                    b[k] = (b.get(k) or 0.0) + float(v)
+                else:
+                    b.setdefault(k, float(v))
+
+        out = []
+        for y in sorted(buckets, reverse=True):
+            b = buckets.pop(y)
+            n = b.pop("_n", 1) or 1
+            rs = b.pop("_ratio_sum", {})
+            for k, vals in rs.items():
+                b[k] = sum(vals) / len(vals) if vals else None
+            out.append({"end_date": f"{y}1231", "statDate": f"{y}-12-31", **b})
+
+        if periods:
+            wanted = {str(p).replace("-", "")[:8] for p in periods}
+            picked = [r for r in out if r["end_date"] in wanted]
+            return picked or out
+        return out[:limit]
+
+    # -- 财务指标（年报口径，比率不累加）--------------------------------
+    def _fetch_fina_indicator(self, code, periods, limit, **kw) -> list[dict]:
+        """AkShare 财务指标（新浪源，已是年报口径）。
+
+        列：报告日 净资产收益率 销售毛利率 销售净利率 每股净资产 资产负债率 ...
+        实测伊利 2024：毛利率 ≈ 33.98（年报口径，非单季累加）
+        """
+        ak = self._get_ak()
+        num = _strip_prefix(code)
+        rows: list[dict] = []
+        try:
+            df = ak.stock_financial_analysis_indicator(symbol=num, start_year="2015")
+            if df is not None and len(df):
+                cols = list(df.columns)
+                def pick(*names):
+                    for n in names:
+                        for c in cols:
+                            if n in str(c):
+                                return c
+                    return None
+                c_roe = pick("净资产收益率")
+                c_gm = pick("销售毛利率")
+                c_nm = pick("销售净利率")
+                c_bps = pick("每股净资产")
+                c_dar = pick("资产负债率")
+                for r in df.to_dict("records"):
+                    d = str(r.get("日期", ""))[:10]
+                    if not d:
+                        continue
+                    rows.append({
+                        "end_date": d.replace("-", ""),
+                        "roe_waa": r.get(c_roe) if c_roe else None,
+                        "grossprofit_margin": r.get(c_gm) if c_gm else None,
+                        "netprofit_margin": r.get(c_nm) if c_nm else None,
+                        "bps": r.get(c_bps) if c_bps else None,
+                        "debt_to_assets": r.get(c_dar) if c_dar else None,
+                    })
+        except Exception:                             # noqa: BLE001
+            rows = []
+
+        if not rows:
+            raise DataSourceError("akshare 财务指标（新浪）无数据")
+        # 只保留年报
+        rows = [r for r in rows if r["end_date"][4:8] == "1231"]
+
+        # 毛利率缺失（新浪源近年为 NaN）-> 从利润表自算
+        def _is_missing(v):
+            return v is None or (isinstance(v, float) and v != v)
+
+        need_gm = [r for r in rows if _is_missing(r.get("grossprofit_margin"))]
+        if need_gm:
+            try:
+                inc = ak.stock_financial_report_sina(stock=_to_sina(code), symbol="利润表")
+                if inc is not None and len(inc):
+                    gm_map = {}
+                    for r in inc.to_dict("records"):
+                        d = str(r.get("报告日", ""))[:8]
+                        if not d.endswith("1231"):
+                            continue
+                        rev = r.get("营业总收入") or r.get("营业收入")
+                        cost = r.get("营业成本")
+                        try:
+                            rev, cost = float(rev), float(cost)
+                            if rev:
+                                gm_map[d[:4]] = (rev - cost) / rev * 100
+                        except (TypeError, ValueError):
+                            pass
+                    for r in rows:
+                        y = r["end_date"][:4]
+                        if _is_missing(r.get("grossprofit_margin")) and y in gm_map:
+                            r["grossprofit_margin"] = gm_map[y]
+            except Exception:                         # noqa: BLE001
+                pass
+
+        # 按期倒序（最新在前）
+        rows = sorted(rows, key=lambda r: r["end_date"], reverse=True)
+        if periods:
+            wanted = {str(p).replace("-", "")[:8] for p in periods}
+            picked = [r for r in rows if r["end_date"] in wanted]
+            return picked or rows
+        return rows[:limit]
+
     # -- 主营业务构成 ---------------------------------------------------
     def _fetch_fina_mainbz(self, code, periods, limit, **kw) -> list[dict]:
         """AkShare stock_zygc_em —— 主营构成（按产品/地区分类）。

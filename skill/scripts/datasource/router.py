@@ -29,7 +29,7 @@ ROUTING: dict[str, list[str]] = {
     "5":   ["akshare", "tushare"],                  # 合并现金流量表（ak 字段最全）
     "6":   ["akshare", "tushare"],                  # 分红历史
     "11":  ["akshare", "tushare"],                  # 十年周线
-    "12":  ["akshare", "zzshare", "tushare"],       # 财务指标
+    "12":  ["akshare", "zzshare", "tushare"],       # 财务指标（ak 口径更准）
     "14":  ["akshare", "tushare"],                  # 无风险利率
     "15":  ["akshare", "tushare"],                  # 股份回购
     "16":  ["akshare", "tushare"],                  # 股权质押
