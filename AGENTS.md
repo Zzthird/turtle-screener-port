@@ -13,6 +13,7 @@
 | Python | `D:\Codes\TurtlePi\skill\.venv\Scripts\python.exe`（3.12） |
 | 已装 pi skill | `~/.pi/agent/skills/turtle-analysis/` |
 | 已装 pi agents | `~/.pi/agent/agents/{quant,valuation,qualitative,auditor}.md` |
+| agent 源文件 | 本项目 `agents/`（已纳入版本管理，与 `~/.pi/agent/agents/` 保持同步） |
 | 数据源 | **AkShare + zzshare + 巨潮 PDF**（A股无需 Tushare token） |
 | 母公司报表覆盖 | **7/7**（含银行、无框线报表） |
 
@@ -194,14 +195,67 @@ $PY = "D:\Codes\TurtlePi\skill\.venv\Scripts\python.exe"
 
 ## 四、Agent 与约束
 
-### 4 个自定义 agent
+### 两类 agent（来源不同）
 
-| Agent | 职责 | 输出 |
+| | **项目 agent** | **内置 agent** |
 |---|---|---|
-| `qualitative` | 6 维度定性（PDF-first + Greenwald 护城河） | `qualitative_report.md` |
-| `quant` | Step 0 校验 + 11 步穿透回报率 | `phase3_quantitative.md` |
-| `valuation` | 估值 + 报告组装（**唯一有权裁决**） | `{公司}_{代码}_分析报告.md` |
-| `auditor` | clean-room 独立重算（防锚定） | `cleanroom_metrics.md` |
+| 提供者 | 本项目（`~/.pi/agent/agents/`） | `pi-subagents` npm 包自带 |
+| 面向 | **龟龟投资框架**（知道 §17 / datapack / 框架规范） | **通用软件开发**（代码侦察/审查/实现/研究） |
+| 升级 | 自行维护，不受包更新影响 | 随包更新 |
+| 同名冲突 | **项目 agent 优先** | — |
+
+**内置 agent 不可能知道** 龟龟框架的概念（`§17.11 网格`、`data_pack_market.md`、`穿透回报率` 等）。
+
+### 什么时候用哪个
+
+| 需求 | 用 |
+|---|---|
+| 龟龟框架分析（定性/定量/估值/审计） | **项目 agent** |
+| 代码审查、代码侦察、联网研究、实现代码 | **内置 agent** |
+| 对当前方案提第二意见 | **内置** `oracle` |
+
+内置 agent 清单（11 个）：`scout`（代码侦察）· `researcher`（联网研究）· `evidence-auditor`（来源核查）· `worker`（实现代码）· `reviewer`（代码审查）· `oracle`（第二意见）· `delegate`（通用）· `claude-code`/`codex-exec`/`cursor-agent`（外部 CLI 桥接，含 `*-writer` 变体）
+
+### 4 个项目 agent
+
+| Agent | 职责 | **工具权限** | 输出 |
+|---|---|---|---|
+| `qualitative` | 6 维度定性（PDF-first + Greenwald 护城河） | read/write/edit | `qualitative_report.md` |
+| `auditor` | clean-room 独立重算（防锚定） | **只读**（无 write/edit） | `cleanroom_metrics.md` |
+| `quant` | Step 0 校验 + 11 步穿透回报率 | read/write/edit | `phase3_quantitative.md` |
+| `valuation` | 估值 + 报告组装（**唯一有权裁决**） | read/write/edit | `{公司}_{代码}_分析报告.md` |
+
+> `auditor` 无写权限是**有意设计** —— 审计员不能改写任何东西，
+> 也就无法「顺手改一下让它对上」。
+
+### 如何调用
+
+**方式 1（推荐）：自然语言，pi 自动选 agent**
+```
+用 qualitative agent 分析 600887.SH，数据包在 output/600887_伊利股份/
+用 quant agent 对 600887.SH 做定量分析
+用 valuation agent 出最终报告
+```
+
+**方式 2：显式调用 subagent 工具**
+```
+subagent({ agent: "quant", task: "..." })
+subagent({ tasks: [ {...}, {...} ] })      ← 并行
+subagent({ chain: [ {...}, {...} ] })      ← 串行
+```
+
+### 并行时序（重要，不可破坏）
+
+Step 2 **必须同时启动** `qualitative` 与 `auditor`：
+```
+subagent({ tasks: [
+  { agent: "qualitative", task: "..." },
+  { agent: "auditor",     task: "..." }
+]})
+```
+
+**原因**：`auditor` 禁读草稿，此刻草稿尚不存在 → 无从被锚定。
+若串行（先 qualitative 再 auditor），防锚定机制失效。
 
 ### 硬约束（写在 SKILL.md 和每个 agent prompt 里）
 
@@ -210,15 +264,7 @@ $PY = "D:\Codes\TurtlePi\skill\.venv\Scripts\python.exe"
 3. **不编造数据** —— 缺失标注 `⚠️ 数据不可用`，禁用「大约/预计」掩盖
 4. **金额单位百万元**，千位逗号，百分比 2 位小数
 5. **禁止向 `strategies/` `shared/` `scripts/` 写文件**
-6. `auditor` **禁读草稿**（`qualitative_report.md` / `computed_metrics.md`）防锚定
-
-### 并行编排（推荐）
-
-```
-Step 2 并行启动:
-  qualitative  →  qualitative_report.md
-  auditor      →  cleanroom_metrics.md     ← 同时启动，草稿尚不存在 → 无从锚定
-```
+6. `auditor` **禁读草稿**（`qualitative_report.md` / `phase3_quantitative.md` / `computed_metrics.md`）防锚定
 
 ---
 
@@ -354,12 +400,15 @@ robocopy "D:\Codes\TurtlePi\skill" "C:\Users\Administrator\.pi\agent\skills\turt
          /E /XD .venv .git /NFL /NDL /NJH /NJS /NP
 ```
 
-改动 `agents/` `prompts/` 后：
+改动本项目 `agents/` `prompts/` 后，同步到 pi：
 
 ```powershell
 Copy-Item "D:\Codes\TurtlePi\agents\*.md"  "C:\Users\Administrator\.pi\agent\agents\" -Force
 Copy-Item "D:\Codes\TurtlePi\prompts\*.md" "C:\Users\Administrator\.pi\agent\prompts\" -Force
 ```
+
+> 双向同步：项目目录（版本管理）+ `~/.pi/agent/`（pi 实际加载）
+> 两者内容应保持一致。
 
 然后 `/reload` 或重启 pi。
 
