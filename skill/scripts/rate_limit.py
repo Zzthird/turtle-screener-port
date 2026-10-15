@@ -52,6 +52,8 @@ COOLDOWN_SECONDS = _env_float("RATE_LIMIT_COOLDOWN", 120.0)
 PAGE_INTERVAL = _env_float("RATE_LIMIT_PAGE_INTERVAL", 0.35)
 # 全市场快照磁盘缓存 TTL（秒）——默认 6 小时，避免同日重复拉取
 SNAPSHOT_TTL = _env_float("SCREENER_SNAPSHOT_TTL", 6 * 3600)
+# 分页上限（防一次性狂拉；设为 0 表示不限）
+MAX_PAGES = int(_env_float("SCREENER_MAX_PAGES", 30))
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +234,8 @@ def describe() -> str:
     st = cd.status()
     lines = [
         f"最小间隔: {MIN_INTERVAL}s | 退避基础: {BACKOFF_BASE}s | 冷却: {COOLDOWN_SECONDS}s",
-        f"分页间隔: {PAGE_INTERVAL}s",
+        f"分页间隔: {PAGE_INTERVAL}s | 分页上限: {MAX_PAGES}（0=不限）",
+        f"快照缓存 TTL: {SNAPSHOT_TTL:.0f}s",
     ]
     if st:
         lines.append("冷却中的域名: " + ", ".join(f"{d}({v:.0f}s)" for d, v in st.items()))

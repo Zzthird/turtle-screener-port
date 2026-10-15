@@ -182,9 +182,11 @@ class FreeScreenerBackend:
         if good is None:
             return None
 
-        # 分页（带间隔）
+        # 分页（带间隔 + 页数上限）
+        from rate_limit import MAX_PAGES
+        max_pages = MAX_PAGES if MAX_PAGES > 0 else 25
         pn = 2
-        while pn <= 25 and len(rows) < total:
+        while pn <= max_pages and len(rows) < total:
             time.sleep(PAGE_INTERVAL)
             try:
                 j = fetch_page(good, pn)
