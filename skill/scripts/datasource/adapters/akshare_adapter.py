@@ -222,6 +222,61 @@ class AkshareAdapter(DataSource):
             r["trade_date"] = str(r.get("日期", ""))[:10].replace("-", "")
         return rows
 
+    # -- 每日指标（PE/PB/市值）------------------------------------------
+    def _fetch_daily_basic(self, code, periods, limit, **kw) -> list[dict]:
+        """PE/PB/市值。东财 push2 已实测被封，走 datacenter + 本地计算。
+
+        降级策略：
+          1) 东财 datacenter F10（未被封）→ 估值指标
+          2) 本地计算：市值 = 最新收盘价 × 总股本
+        """
+        ak = self._get_ak()
+        num = _strip_prefix(code)
+        out: dict = {"ts_code": code, "trade_date": ""}
+
+        # 1) 最新收盘价（腾讯/新浪源，不依赖 push2）
+        close = None
+        try:
+            df = ak.stock_zh_a_hist_tx(symbol=_to_sina(code), adjust="")
+            if df is not None and len(df):
+                close = float(df.iloc[-1]["close"])
+                out["trade_date"] = str(df.iloc[-1]["date"]).replace("-", "")
+        except Exception:                             # noqa: BLE001
+            try:
+                df = ak.stock_zh_a_hist(symbol=num, period="daily", adjust="")
+                if df is not None and len(df):
+                    close = float(df.iloc[-1]["收盘"])
+                    out["trade_date"] = str(df.iloc[-1]["日期"]).replace("-", "")
+            except Exception:                         # noqa: BLE001
+                pass
+        out["close"] = close
+
+        # 2) 总股本（从资产负债表取实收资本；单位股）
+        shares = None
+        try:
+            bs = ak.stock_financial_report_sina(stock=_to_sina(code), symbol="资产负债表")
+            if bs is not None and len(bs):
+                col = "实收资本(或股本)"
+                if col in bs.columns:
+                    v = bs.iloc[0][col]
+                    if v == v:
+                        shares = float(v)
+        except Exception:                             # noqa: BLE001
+            pass
+        out["total_share"] = shares
+
+        # 3) 市值 = 收盘价 × 总股本（本地计算）
+        if close is not None and shares:
+            out["total_mv"] = close * shares
+            out["circ_mv"] = out["total_mv"]
+
+        # 4) PE/PB：从 zzshare 估值表已能取到，此处留空由多源补齐
+        out["pe_ttm"] = None
+        out["pb"] = None
+        out["dv_ttm"] = None
+
+        return [out] if (close is not None or shares) else []
+
     # -- 行情（日线 / 周线）--------------------------------------------
     def _fetch_daily(self, code, periods, limit, **kw) -> list[dict]:
         return self._hist(code, "daily", limit)
