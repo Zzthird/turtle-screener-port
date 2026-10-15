@@ -18,10 +18,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # 目标报表 → 标题关键词（按顺序匹配，避免"合并"误命中）
+# 注：银行年报用「本行」/「公司」代替一般企业的「母公司」
 REPORTS = {
-    "母公司资产负债表": ["母公司资产负债表", "本行资产负债表"],
-    "母公司利润表": ["母公司利润表", "本行利润表"],
-    "母公司现金流量表": ["母公司现金流量表", "本行现金流量表"],
+    "母公司资产负债表": ["母公司资产负债表", "本行资产负债表", "公司资产负债表"],
+    "母公司利润表": ["母公司利润表", "本行利润表", "公司利润表"],
+    "母公司现金流量表": ["母公司现金流量表", "本行现金流量表", "公司现金流量表"],
 }
 
 # 标题变体（带"续"、换行、空格）
@@ -113,6 +114,91 @@ ITEM_MAPS = {
     "母公司现金流量表": CASHFLOW_ITEMS,
 }
 
+# ============ 银行专用科目映射 ============
+BANK_BALANCE_ITEMS = {
+    "现金": "货币资金",
+    "现金及存放中央银行款项": "货币资金",
+    "贵金属": "贵金属",
+    "存放中央银行款项": "存放央行款项",
+    "存放同业和其他金融机构款项": "存放同业",
+    "拆出资金": "拆出资金",
+    "衍生金融资产": "衍生金融资产",
+    "买入返售金融资产": "买入返售",
+    "发放贷款和垫款": "发放贷款及垫款",
+    "贷款和垫款": "发放贷款及垫款",
+    "金融投资": "金融投资",
+    "交易性金融资产": "交易性金融资产",
+    "债权投资": "债权投资",
+    "其他债权投资": "其他债权投资",
+    "长期股权投资": "长期股权投资",
+    "固定资产": "固定资产",
+    "在建工程": "在建工程",
+    "无形资产": "无形资产",
+    "商誉": "商誉",
+    "递延所得税资产": "递延所得税资产",
+    "其他资产": "其他资产",
+    "资产总计": "总资产",
+    "资产合计": "总资产",
+    "向中央银行借款": "向央行借款",
+    "同业及其他金融机构存放款项": "同业存放",
+    "拆入资金": "拆入资金",
+    "衍生金融负债": "衍生金融负债",
+    "卖出回购金融资产款": "卖出回购",
+    "吸收存款": "吸收存款",
+    "应付职工薪酬": "应付职工薪酬",
+    "应交税费": "应交税费",
+    "应付债券": "应付债券",
+    "递延所得税负债": "递延所得税负债",
+    "其他负债": "其他负债",
+    "负债合计": "总负债",
+    "归属于本行股东权益": "归母权益",
+    "归属于本行股东权益合计": "归母权益",
+    "归属于母公司股东权益合计": "归母权益",
+    "股本": "实收资本",
+    "资本公积": "资本公积",
+    "其他综合收益": "其他综合收益",
+    "盈余公积": "盈余公积",
+    "一般风险准备": "一般风险准备",
+    "未分配利润": "未分配利润",
+    "少数股东权益": "少数股东权益",
+    "股东权益合计": "所有者权益合计",
+    "所有者权益合计": "所有者权益合计",
+    "负债及股东权益总计": "负债及权益总计",
+    "负债和股东权益总计": "负债及权益总计",
+}
+
+BANK_INCOME_ITEMS = {
+    "营业收入": "营业收入",
+    "利息收入": "利息收入",
+    "利息支出": "利息支出",
+    "净利息收入": "净利息收入",
+    "手续费及佣金收入": "手续费收入",
+    "手续费及佣金支出": "手续费支出",
+    "手续费及佣金净收入": "手续费净收入",
+    "其他净收益": "其他净收益",
+    "业务及管理费": "业务管理费",
+    "营业税金及附加": "营业税金",
+    "资产减值损失": "资产减值损失",
+    "信用减值损失": "信用减值损失",
+    "营业利润": "经营利润",
+    "利润总额": "利润总额",
+    "所得税费用": "所得税",
+    "净利润": "净利润",
+    "归属于本行股东的净利润": "归母净利润",
+    "归属于母公司股东的净利润": "归母净利润",
+    "少数股东损益": "少数股东损益",
+}
+
+# 银行专用映射（按报表名覆盖）
+BANK_ITEM_MAPS = {
+    "母公司资产负债表": BANK_BALANCE_ITEMS,
+    "母公司利润表": BANK_INCOME_ITEMS,
+    "母公司现金流量表": CASHFLOW_ITEMS,
+}
+
+# 银行标识（页面含这些词则启用银行科目映射）
+BANK_MARKERS = ("银行", "本行", "吸收存款", "发放贷款")
+
 _NUM = re.compile(r"^-?[\d,]+\.?\d*$")
 _YEAR = re.compile(r"(20\d{2})")
 
@@ -177,7 +263,16 @@ def _guess_report_year(text: str) -> Optional[int]:
 
 
 def _is_toc_page(text: str) -> bool:
-    """目录页判定：点线引导符或大量页码。"""
+    """目录页判定：点线引导符 或 典型目录特征。
+
+    注意：银行报表科目名短、行尾多为数字，易误判。
+    因此若页首含明确的报表标题，一律不视为目录。
+    """
+    head = text[:120]
+    for kws in REPORTS.values():
+        for k in kws:
+            if k in head:
+                return False          # 明确标题 -> 不是目录页
     if "......" in text or "…" in text or "‧‧" in text:
         return True
     # 短页面 + 行尾多为数字（目录特征）
@@ -273,9 +368,9 @@ def _label_col(table: list[list[str]]) -> int:
 
 
 def _collect_items(tables: list[list[list[str]]], name: str,
-                   years: list[str]) -> dict[str, list[Optional[float]]]:
-    """从多张表（含跨页续表）提取科目值。"""
-    all_items = ITEM_MAPS[name]
+                   years: list[str], bank: bool = False) -> dict[str, list[Optional[float]]]:
+    """从多张表（含跨页续表）提取科目值。bank=True 时用银行科目映射。"""
+    all_items = (BANK_ITEM_MAPS if bank else ITEM_MAPS)[name]
     items: dict[str, list[Optional[float]]] = {}
     for best in tables:
         lc = _label_col(best)                 # 科目所在列
@@ -300,6 +395,59 @@ def _collect_items(tables: list[list[list[str]]], name: str,
                     if nums:
                         items[biz] = nums[:len(years)] if years else nums
                     break
+    return items
+
+
+# 数据行正则：科目名 + 可选附注 + 1~2 个数值
+# 实测招行: '利息收入 42 347,786 351,273' / '净利息收入 205,493 207,705'
+_LINE_NUM = r"[-−]?\(?\d{1,3}(?:,\d{3})+(?:\.\d+)?\)?"
+_ROW_RE = re.compile(
+    r"^(?P<label>[\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z（）()、：:·\s]{1,40}?)\s+"
+    r"(?:(?P<note>[\u4e00-\u9fa5A-Za-z0-9（）()·\.]{1,12})\s+)?"
+    r"(?P<v1>%s)"
+    r"(?:\s+(?P<v2>%s))?\s*$" % (_LINE_NUM, _LINE_NUM)
+)
+
+
+def _parse_text_rows(text: str, all_items: dict, years: list[str]) -> dict[str, list[Optional[float]]]:
+    """从纯文本行解析报表（应对无框线/列合并的 PDF）。
+
+    格式：科目 [附注] 数值1 [数值2]
+    """
+    items: dict[str, list[Optional[float]]] = {}
+    ncol = max(len(years), 1)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or len(line) < 6:
+            continue
+        m = _ROW_RE.match(line)
+        if not m:
+            continue
+        label = m.group("label").replace(" ", "").replace("　", "")
+        label = re.sub(r"^[一二三四五六七八九十]+、", "", label)
+        label = re.sub(r"^(减|加|其中|其中：|及)：?", "", label).replace("：", "").strip()
+        if not label:
+            continue
+        def _n(s):
+            if not s:
+                return None
+            neg = s.startswith("(") or s.startswith("−") or s.startswith("-")
+            t = s.strip("()（）").replace(",", "").replace("−", "-")
+            try:
+                v = float(t)
+                return -v if (neg and v > 0) else v
+            except ValueError:
+                return None
+        vals = [_n(m.group("v1")), _n(m.group("v2"))]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            continue
+        for anchor, biz in all_items.items():
+            if biz in items:
+                continue
+            if label == anchor or label.startswith(anchor):
+                items[biz] = (vals + [None] * ncol)[:ncol]
+                break
     return items
 
 
@@ -340,6 +488,8 @@ def extract_parent_reports(pdf_path: str, verbose: bool = False) -> dict[str, Re
                     continue
 
                 unit = _detect_unit(text)
+                # 银行年报：启用银行科目映射
+                bank = any(m in text for m in BANK_MARKERS)
 
                 # 跨页续表：向后扫描，直到出现下一张报表标题
                 chain = list(tables)
@@ -357,7 +507,32 @@ def extract_parent_reports(pdf_path: str, verbose: bool = False) -> dict[str, Re
                     chain.extend(more)
                     j += 1
 
-                items = _collect_items(chain, name, years)
+                items = _collect_items(chain, name, years, bank=bank)
+
+                # 银行报表：表格提取易把「附注」列误当数值 -> 优先用文本行解析
+                use_text = bank
+                if use_text or len(items) < 4:
+                    all_items = (BANK_ITEM_MAPS if bank else ITEM_MAPS)[name]
+                    txt_items = _parse_text_rows(text, all_items, years)
+                    j2 = pno + 1
+                    while j2 < n_pages and j2 <= pno + 4:
+                        nt = pdf.pages[j2].extract_text() or ""
+                        if any(_has_title(nt, k) for k in REPORTS) and not _has_title(nt, name):
+                            break
+                        if _is_toc_page(nt):
+                            break
+                        more = _parse_text_rows(nt, all_items, years)
+                        if not more:
+                            break
+                        for k, v in more.items():
+                            txt_items.setdefault(k, v)
+                        j2 += 1
+                    if bank or len(txt_items) > len(items):
+                        if txt_items:
+                            items = txt_items
+                            if verbose:
+                                print(f"    （文本行解析 → {len(items)} 科目）")
+
                 if items:
                     # 占位年份 T/T-1 -> 用 PDF 里的报告年份回填
                     if years and years[0] == "T":
