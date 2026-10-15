@@ -138,11 +138,19 @@ class DomainCooldown:
 # ---------------------------------------------------------------------------
 
 def _is_block_error(exc: Exception) -> bool:
-    """判断异常是否像"被风控"（而非数据缺失）。"""
+    """判断异常是否像"被风控"（而非服务端/网络故障）。
+
+    注意：5xx（502/503/504）是**服务端故障**，不应触发域冷却
+    —— 否则节点抖动会让整个域名被拉黑。
+    """
     s = f"{type(exc).__name__}: {exc}".lower()
+    # 服务端故障（不冷却）
+    if any(k in s for k in ("502", "503", "504", "bad gateway",
+                            "service unavailable", "gateway timeout")):
+        return False
     keys = ("remote disconnected", "connection aborted", "connection reset",
-            "too many requests", "429", "403", "forbidden", "timeout",
-            "max retries", "connectionerror", "sslerror", "eof occurred")
+            "too many requests", "429", "403", "forbidden",
+            "max retries", "connectionerror", "eof occurred")
     return any(k in s for k in keys)
 
 
@@ -209,16 +217,23 @@ NO_PROXY_HOSTS = (
 )
 
 
-def make_session(disable_proxy: bool = True):
+def make_session(disable_proxy: bool = True, force_proxy: bool = False):
     """创建 requests 会话。
 
-    ⚠️ 本项目所有国内财经站请求**必须直连**：
-       - 走代理（境外节点）→ 东财/新浪一律拒绝
-       - 直连            → 正常（除非本机 IP 临时被风控）
-    因此默认 trust_env=False，不读 HTTP_PROXY/HTTPS_PROXY。
+    本项目国内财经站的网络策略（实测）：
+      - **直连可用**（无代理时）：东财 datacenter/巨潮/新浪均直连正常
+      - **但东财 push2 例外**：实测在【全局代理】下直连会 RemoteDisconnected，
+        走系统代理才能通（因该域名对直连 IP 有额外风控）。
+
+    参数：
+      disable_proxy=True   不读系统代理（默认，适合 datacenter/巨潮等）
+      force_proxy=True     强制走系统代理（适合东财 push2 行情）
     """
     import requests
     s = requests.Session()
+    if force_proxy and os.environ.get("EM_USE_PROXY", "1") != "0":
+        s.trust_env = True          # 读 HTTP_PROXY / 系统代理
+        return s
     if disable_proxy:
         s.trust_env = False
         s.proxies = {"http": None, "https": None}

@@ -85,7 +85,8 @@ class FreeScreenerBackend:
         m["area"] = ""
         m["market"] = ""
         m["list_date"] = ""
-        m["dv_ttm"] = None
+        # 股息率：优先用源数据（push2 的 f37），降级为 None
+        m["dv_ttm"] = pd.to_numeric(df.get("dv_ttm"), errors="coerce")
         self._snapshot = m
         # 写磁盘缓存
         if cache is not None:
@@ -145,21 +146,34 @@ class FreeScreenerBackend:
         cd = DomainCooldown()
         from rate_limit import make_session
         from em_cookie import get_headers
-        s = make_session()          # 国内财经站直连
+        s = make_session(force_proxy=True)   # 东财 push2 需走系统代理（实测）
         s.headers.update(get_headers(verbose=self.verbose))   # 含反爬 Cookie
         fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
-        fields = "f12,f14,f2,f9,f23,f20,f21,f8"
+        # f37 = 股息率(%)（探测确认：平安银行 5.22 / 万科 -13.65）
+        fields = "f12,f14,f2,f9,f23,f20,f21,f8,f37"
 
-        # 候选有限（不扫描全部子域）
-        hosts = ["82.push2.eastmoney.com", "2.push2.eastmoney.com"]
+        # 候选域名：push2delay 风控最宽松（实测可用），其余作备份
+        hosts = [
+            "82.push2delay.eastmoney.com",
+            "push2delay.eastmoney.com",
+            "82.push2.eastmoney.com",
+            "2.push2.eastmoney.com",
+        ]
 
         def fetch_page(host: str, pn: int) -> Optional[dict]:
             throttle(host)
+            # 最小参数集（实测：多带 po/np/fltt/invt/fid 易触发 502）
             r = s.get("https://%s/api/qt/clist/get" % host,
-                      params={"pn": pn, "pz": 1000, "po": 1, "np": 1, "fltt": 2,
-                              "invt": 2, "fid": "f12", "fs": fs, "fields": fields},
+                      params={"pn": pn, "pz": 200, "fs": fs, "fields": fields},
                       timeout=25)
-            return r.json()
+            # 服务端可能返回非 JSON（风控页/网关错误）
+            try:
+                return r.json()
+            except Exception as e:                    # noqa: BLE001
+                raise ValueError(
+                    f"非 JSON 响应（HTTP {r.status_code}, len={len(r.text)}）: "
+                    f"{r.text[:80]!r}"
+                ) from e
 
         good = None
         rows: list = []
@@ -171,41 +185,52 @@ class FreeScreenerBackend:
                 continue
             try:
                 j = backoff_call(lambda h=host: fetch_page(h, 1),
-                                 retries=3, domain=host, cooldown=cd,
+                                 retries=2, domain=host, cooldown=cd,
                                  verbose=self.verbose)
-                d = (j or {}).get("data") or {}
-                diff = d.get("diff") or {}
-                chunk = list(diff.values()) if isinstance(diff, dict) else list(diff)
-                if chunk:
-                    good = host
-                    total = d.get("total") or 0
-                    rows.extend(chunk)
-                    break
             except Exception as e:                    # noqa: BLE001
                 if self.verbose:
-                    print(f"[free-backend] {host} 失败: {str(e)[:60]}")
-
+                    print(f"[free-backend] {host} 失败: {str(e)[:50]}")
+                continue
+            d = (j or {}).get("data") or {}
+            diff = d.get("diff")
+            chunk = list(diff.values()) if isinstance(diff, dict) else (diff or [])
+            if not chunk:
+                continue
+            good = host
+            total = d.get("total") or 0
+            rows.extend(chunk)
+            break
         if good is None:
             return None
 
-        # 分页（带间隔 + 页数上限）
+        # 分页（带间隔 + 页数上限 + 单页失败重试）
         from rate_limit import MAX_PAGES
         max_pages = MAX_PAGES if MAX_PAGES > 0 else 25
+        page_size = 200
+        fail_streak = 0
         pn = 2
         while pn <= max_pages and len(rows) < total:
             time.sleep(PAGE_INTERVAL)
             try:
                 j = fetch_page(good, pn)
-            except Exception:                         # noqa: BLE001
-                cd.mark_blocked(good)
-                break
+                fail_streak = 0
+            except Exception as e:                    # noqa: BLE001
+                fail_streak += 1
+                if self.verbose:
+                    print(f"[free-backend] 第 {pn} 页失败（{fail_streak}）：{str(e)[:40]}")
+                if fail_streak >= 2:
+                    break                             # 连续两页失败 -> 放弃
+                pn += 1                               # 跳过该页继续
+                continue
             d = (j or {}).get("data") or {}
-            diff = d.get("diff") or {}
-            chunk = list(diff.values()) if isinstance(diff, dict) else list(diff)
+            diff = d.get("diff")
+            chunk = list(diff.values()) if isinstance(diff, dict) else (diff or [])
             if not chunk:
                 break
             rows.extend(chunk)
-            if len(chunk) < 100:
+            if total and len(rows) >= total:
+                break
+            if len(chunk) < page_size:                # 已到最后一页
                 break
             pn += 1
 
@@ -223,7 +248,17 @@ class FreeScreenerBackend:
             "total_mv": r.get("f20"),
             "circ_mv": r.get("f21"),
             "turnover_rate": r.get("f8"),
+            "dv_ttm": r.get("f37"),      # 股息率(%)，探测确认
         } for r in rows])
+
+        # ⚠️ 字段值缩放：东财在不带 fltt 参数时返回 x100 的整数
+        #    f2(价格)/f9(PE)/f23(PB) 需 ÷100
+        #    f8(换手率) 已是百分数，无需缩放
+        #    f20/f21(市值，元) / f37(股息率%) 原值
+        for col in ("close", "pe_ttm", "pb"):
+            out[col] = pd.to_numeric(out[col], errors="coerce") / 100.0
+        for col in ("total_mv", "circ_mv", "turnover_rate", "dv_ttm"):
+            out[col] = pd.to_numeric(out[col], errors="coerce")
         out = out[out["ts_code"].str.len() >= 9]
         return out
 
@@ -253,7 +288,8 @@ class FreeScreenerBackend:
                 out["name"] = df[pick("名称", "name")].astype(str) if pick("名称", "name") else ""
                 for tgt, cands in [("close", ("最新价", "现价")), ("pe_ttm", ("市盈率-动态", "市盈率")),
                                    ("pb", ("市净率",)), ("total_mv", ("总市值",)),
-                                   ("circ_mv", ("流通市值",)), ("turnover_rate", ("换手率",))]:
+                                   ("circ_mv", ("流通市值",)), ("turnover_rate", ("换手率",)),
+                                   ("dv_ttm", ("股息率",))]:
                     c = pick(*cands)
                     out[tgt] = pd.to_numeric(df[c], errors="coerce") if c else None
                 if self.verbose:
