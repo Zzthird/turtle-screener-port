@@ -1,7 +1,8 @@
 ---
 name: turtle-analysis
 description: 龟龟投资框架（Turtle Investment Framework）四因子基本面分析，覆盖 A股/港股/美股。
-  用 Tushare 采集确定性数据，Python 脚本完成穿透回报率、估值与选股筛选，LLM 只做定性判断与解释。
+  多数据源自动降级（AkShare/zzshare/巨潮PDF/Tushare）采集确定性数据，Python 脚本完成穿透回报率、
+  估值与选股筛选，LLM 只做定性判断与解释。无 Tushare token 也能跑 A 股。
   当用户要求个股基本面分析、穿透回报率计算、价值陷阱排查、深价值选股、
   或提到"龟龟策略""龟龟框架""turtle"时使用。
 ---
@@ -22,10 +23,42 @@ description: 龟龟投资框架（Turtle Investment Framework）四因子基本�
 
 **调用脚本一律用**：`.venv\Scripts\python.exe scripts\xxx.py ...`
 
-## 前置条件（必须先检查）
+## 数据采集（核心）
 
-1. **`TUSHARE_TOKEN`** — 未配置则数据层不可用（仅能 yfinance 降级）
-2. 脚本以 **CLI 方式**运行，不要 `import scripts.xxx`
+**统一入口**：`scripts/data_collector.py`（替代 tushare_collector.py）
+
+```powershell
+# 采集全部 16 段（默认）
+.venv\Scripts\python.exe scripts\data_collector.py --code 600887.SH
+
+# 指定输出
+.venv\Scripts\python.exe scripts\data_collector.py --code 600887.SH --output output/600887_伊利股份/data_pack_market.md
+
+# 限定源 / 段
+.venv\Scripts\python.exe scripts\data_collector.py --code 600887.SH --sources akshare,zzshare
+.venv\Scripts\python.exe scripts\data_collector.py --code 600887.SH --sections 3,4,5
+
+# 查看可用源
+.venv\Scripts\python.exe scripts\data_collector.py --list-sources
+```
+
+**源优先级（按段配置）**：
+| 段 | 源 |
+|---|---|
+| §1-7, §9, §11, §12, §14-16 | akshare → zzshare → tushare |
+| §3P, §4P 母公司报表 | **cninfo_pdf**（巨潮年报）→ tushare |
+| §13 风险警示 | local（确定性检测） |
+
+**年报 PDF 下载**（§3P/§4P 需要）：
+```powershell
+.venv\Scripts\python.exe scripts\cninfo_downloader.py --code 600887.SH --year 2024
+```
+
+## 前置条件
+
+1. **无需 Tushare token** — AkShare 覆盖 16 段中的 14 段（其余为 PDF/本地）
+2. 港股/美股需 Tushare 或 yfinance
+3. 脚本以 **CLI 方式**运行，不要 `import scripts.xxx`
 
 ## 三条流水线
 
@@ -102,15 +135,16 @@ Phase 3.2  Agent C（valuation）：估值 + 报告组装
 
 | 脚本 | 用途 |
 |---|---|
-| `tushare_collector.py` | 数据采集（支持 `--refresh-market`） |
+| **`data_collector.py`** | **统一数据采集（推荐，16 段路由）** |
+| `cninfo_downloader.py` | 巨潮年报下载（港股/母公司报表用） |
+| `pdf_parent_extractor.py` | 母公司三表 PDF 提取（§3P/§4P） |
+| `tushare_collector.py` | 原 Tushare 采集（需 token，备用） |
 | `pdf_preprocessor.py` | 年报 PDF 7 章节提取 |
 | `quality_control.py` | 确定性预算指标 → `computed_metrics.md` |
-| `derived_metrics.py` | §17 网格预计算（模块） |
 | `valuation_engine.py` | DCF/DDM/可比/Graham |
 | `screener_core.py` | 两级选股筛选 |
 | `report_consistency.py` | 跨段数值冲突扫描 |
 | `report_to_html.py` | MD → HTML 仪表盘 |
-| `download_report.py` | 年报下载 |
 
 ## 异常处理
 
