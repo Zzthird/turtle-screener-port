@@ -1464,11 +1464,14 @@ class TushareScreener:
                 bvps = equity / total_shares
                 baselines.append(("bvps", bvps))
 
-        # ③ 10-year low
+        # ③ 历史最低价（列名兼容：zzshare 聚合给「收盘价」，
+        #    旧 akshare 路径给 close）
         if not weekly_df.empty:
-            min_close = weekly_df["close"].dropna().min()
-            if min_close is not None and min_close == min_close:
-                baselines.append(("10yr_low", float(min_close)))
+            _ccol = "close" if "close" in weekly_df.columns else "收盘价"
+            if _ccol in weekly_df.columns:
+                min_close = pd.to_numeric(weekly_df[_ccol], errors="coerce").dropna().min()
+                if min_close is not None and min_close == min_close:
+                    baselines.append(("10yr_low", float(min_close)))
 
         # ④ Dividend implied price
         rf = self._rf_cache

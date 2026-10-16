@@ -141,17 +141,25 @@ class AkshareAdapter(DataSource):
     # -- 现金流量表（东财优先 → 新浪降级）------------------------------
     def _fetch_cashflow(self, code, periods, limit, **kw) -> list[dict]:
         ak = self._get_ak()
-        # 0) 同花顺（按年度）—— 最快且字段验证齐全。
-        #    实测（2026-10）：0.26s vs 东财 2.11s，快 8 倍。
-        #    数值已逐项验证（伊利/茅台/美的 OCF 精确匹配）。
-        #    需 pivot 长表 -> 宽表，且 OCF 要自己算（流入小计 - 流出小计）。
+        # 0) 新浪 openapi（quotes.sina.cn）—— 最快（0.12s）且科目最齐（64 项）。
+        #    实测（2026-10）：官方 JSON 接口，非爬网页；
+        #    含 OCF/员工/Capex/V1/V5 全部 AA 所需科目（伊利数值与真值一致）。
+        #    旧实现走 AkShare 的 stock_financial_report_sina（另一个新浪路径，
+        #    字段仅 71 列），已改为本端点优先。
         try:
-            rows = self._ths_cashflow(code, periods, limit)
-            if rows:
+            rows = self._sina_openapi_cashflow(code, periods, limit)
+            if rows and self._cashflow_usable(rows):
                 return rows
         except Exception:                             # noqa: BLE001
             pass
-        # 1) 东财（含 D&A / 资本开支 / 已付股息）
+        # 1) 同花顺
+        try:
+            rows = self._ths_cashflow(code, periods, limit)
+            if rows and self._cashflow_usable(rows):
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 2) 东财（含 D&A / 资本开支 / 已付股息）
         try:
             df = ak.stock_cash_flow_sheet_by_report_em(symbol=_to_em(code))
             if df is not None and len(df):
@@ -161,9 +169,100 @@ class AkshareAdapter(DataSource):
                 return rows[:limit]
         except Exception:                             # noqa: BLE001
             pass
-        # 2) 新浪降级（D&A 缺失）
+        # 3) 新浪（AkShare 旧路径）降级
         rows = self._sina_report(code, "cashflow", "现金流量表", AF.PERIOD_COL_SINA, periods, limit)
         return rows
+
+    @staticmethod
+    def _sina_openapi_report(code: str, report_type: str, num: int = 8) -> list[dict]:
+        """新浪官方 JSON 接口取财报三表（非爬网页）。
+
+        端点：https://quotes.sina.cn/cn/api/openapi.php/
+                 CompanyFinanceService.getFinanceReport2022
+        report_type: lrb(利润表) / fzb(资产负债表) / llb(现金流量表)
+
+        返回：按报告期【升序】的记录列表，每条含「报表日期」及科目中文名。
+        """
+        import requests
+        prefix = "sh" if str(code)[:1] in ("6", "9") else "sz"
+        sym = _strip_prefix(code)
+        url = ("https://quotes.sina.cn/cn/api/openapi.php/"
+               "CompanyFinanceService.getFinanceReport2022")
+        r = requests.get(
+            url,
+            params={"paperCode": f"{prefix}{sym}", "source": report_type,
+                    "type": "0", "page": "1", "num": str(num)},
+            headers={"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/131.0.0.0 Safari/537.36")},
+            timeout=20,
+        )
+        j = r.json() or {}
+        rl = ((j.get("result") or {}).get("data") or {}).get("report_list") or {}
+        rows = []
+        for period in sorted(rl.keys()):              # 升序
+            obj = rl[period] or {}
+            rec: dict = {"报表日期": str(period),
+                         "end_date": str(period)}
+            for it in (obj.get("data") or []):
+                title = (it or {}).get("item_title", "")
+                val = (it or {}).get("item_value")
+                if not title or val in (None, "", "--"):
+                    continue
+                rec[title] = val
+            rows.append(rec)
+        return rows
+
+    @classmethod
+    def _sina_openapi_cashflow(cls, code: str, periods, limit: int) -> list[dict]:
+        """新浪 openapi 现金流量表 -> Tushare 风格行（列名保持中文，与映射层一致）。"""
+        rows = cls._sina_openapi_report(code, "llb", num=max(8, (limit or 8)))
+        if not rows:
+            return []
+        # only 年报（12-31）；periods 限定则再过滤（与东财/同花顺路径口径一致）
+        wanted = None
+        if periods:
+            wanted = {str(p).replace("-", "")[:8] for p in periods}
+        out = []
+        for r in rows:
+            ed = str(r.get("end_date") or "")
+            if not ed.endswith("1231"):
+                continue
+            if wanted is not None and ed not in wanted:
+                continue
+            out.append({
+                "报表日期": ed,
+                "经营活动产生的现金流量净额": r.get("经营活动产生的现金流量净额"),
+                "支付给职工以及为职工支付的现金": r.get("支付给职工以及为职工支付的现金"),
+                "购建固定资产、无形资产和其他长期资产所支付的现金":
+                    r.get("购建固定资产、无形资产和其他长期资产所支付的现金"),
+                "处置固定资产、无形资产和其他长期资产所收回的现金净额":
+                    r.get("处置固定资产、无形资产和其他长期资产所收回的现金净额"),
+                "取得投资收益收到的现金": r.get("取得投资收益收到的现金"),
+                "分配股利、利润或偿付利息所支付的现金":
+                    r.get("分配股利、利润或偿付利息所支付的现金"),
+                "投资活动产生的现金流量净额": r.get("投资活动产生的现金流量净额"),
+                "支付的其他与经营活动有关的现金":
+                    r.get("支付的其他与经营活动有关的现金"),
+                "end_date": ed,
+            })
+        out.sort(key=lambda x: x["end_date"], reverse=True)
+        return out[:limit]
+
+    @staticmethod
+    def _cashflow_usable(rows: list[dict]) -> bool:
+        """校验同花顺现金流结果是否可用（防脏数据）。
+
+        同花顺风控可能返回「有行但值为空」的结果 —— 若直接采用，
+        AA 会在 OCF/资本开支缺失下静默算错。因此要求：
+          最近一期同时有【经营活动现金流净额】与【资本开支】。
+        """
+        for r in rows[:2]:
+            ocf = r.get("经营活动产生的现金流量净额")
+            capex = r.get("购建固定资产、无形资产和其他长期资产所支付的现金")
+            if ocf is not None and capex is not None:
+                return True
+        return False
 
     @staticmethod
     def _ths_cashflow(code: str, periods, limit: int) -> list[dict]:
