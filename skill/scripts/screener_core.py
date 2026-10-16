@@ -38,6 +38,20 @@ def _get_tushare_client_class():
     return _TushareClient
 
 
+def _sf(val):
+    """安全转 float：None / NaN / 非数值 -> None。
+
+    模块级版本（各方法内原有同名局部函数保持不变，互不干扰）。
+    """
+    if val is None:
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None          # 排除 NaN
+
+
 # ============================================================
 # Tier 2 field supersets (union of all consumers per API)
 # ============================================================
@@ -176,7 +190,7 @@ class TushareScreener:
             if ts_code:
                 return b.fina_indicator(ts_code)
             return pd.DataFrame()
-        if api_name in ("income", "cashflow", "dividend", "yc_cb"):
+        if api_name in ("income", "cashflow", "balancesheet", "dividend", "yc_cb"):
             return b.dataset_call(api_name, ts_code, **kwargs)
         if api_name == "trade_cal":
             return b.trade_cal(kwargs.get("start_date", ""), kwargs.get("end_date", ""))
@@ -673,20 +687,27 @@ class TushareScreener:
             return self._check_obs_quality(ts_code, metrics, cfg)
 
         # Financial quality checks (main channel)
-        # 银行/非银金融为高杠杆行业（存款即负债），阈值按文档意图放宽
+        # ⚠️ 已前移至 Tier1（见 screener_config.tier1_apply_quality）：
+        #    ROE/毛利率/负债率 三项均用【智兔 /hicw/* 全市场批量】筛过一遍，
+        #    Tier2 再判一次属重复（150 只 × 逐股请求，纯浪费）。
+        #    此处【只采集指标供打分/报告用】，不再做门槛判断。
+        #    用 tier2_recheck_quality=True 可恢复旧行为（调试用）。
         ind = self._industry_of(ts_code)
         is_bank = any(k in ind for k in cfg.bank_industries)
         max_debt = cfg.max_debt_ratio_bank if is_bank else cfg.max_debt_ratio
         min_gm = cfg.min_gross_margin_bank if is_bank else cfg.min_gross_margin
         metrics["industry"] = ind
         metrics["is_bank"] = is_bank
+        metrics["max_debt_used"] = max_debt
+        metrics["min_gm_used"] = min_gm
 
-        if metrics["roe_waa"] is not None and metrics["roe_waa"] < cfg.min_roe:
-            return False, metrics
-        if metrics["gross_margin"] is not None and metrics["gross_margin"] < min_gm:
-            return False, metrics
-        if metrics["debt_to_assets"] is not None and metrics["debt_to_assets"] > max_debt:
-            return False, metrics
+        if getattr(cfg, "tier2_recheck_quality", False):
+            if metrics["roe_waa"] is not None and metrics["roe_waa"] < cfg.min_roe:
+                return False, metrics
+            if metrics["gross_margin"] is not None and metrics["gross_margin"] < min_gm:
+                return False, metrics
+            if metrics["debt_to_assets"] is not None and metrics["debt_to_assets"] > max_debt:
+                return False, metrics
 
         return True, metrics
 
@@ -881,43 +902,130 @@ class TushareScreener:
         else:
             result["M"] = None
 
-        # AA = 真实可支配现金结余（取近 N 年均值，默认 2 年；单年易受波动影响）
-        # AA ≈ OCF + V1(资产处置) - V_deduct(补贴等) - |Capex|
+        # AA = 真实可支配现金结余（对齐 §17.5 完整 11 步口径）
+        #
+        # 旧实现（已废弃）：AA = OCF - V_deduct - Capex
+        #   缺陷：① 起点是 OCF（结果），非从营收还原
+        #         ② V1（资产处置）硬编码 0，从不取值
+         #         ③ 多扣 V_deduct（§17.5 无此扣减）→ 系统性低估 AA
+        #
+        # 新实现：AA = 真实现金收入 + V1 + V5 - W - Y
+        #   真实现金收入 = S - AR净增 - max(预收净减, 0)
+        #   W = W1(营业成本+应付净减) + W2(员工) + W3(税) + W4(利息)
+        #   Y = Capex + 取得子公司支付
+        #   V1 = 处置固定资产收回；V5 = 取得投资收益收到
         AA = None
+        aa_detail: dict[str, float] = {}
         try:
             aa_win = int(os.environ.get("SCREENER_AA_YEARS", "2"))
         except ValueError:
             aa_win = 2
-        if not cf_df.empty:
+        if not cf_df.empty and not annual_inc.empty:
             cf_sorted = cf_df.sort_values("end_date", ascending=False)
             annual_cf = cf_sorted[cf_sorted["end_date"].astype(str).str.endswith("1231")]
             import datetime as _dtc
             annual_cf = annual_cf[annual_cf["end_date"].astype(str).str[:4].astype(int)
                                   < _dtc.date.today().year]
+
+            # 资产负债表（应收/应付/合同负债）—— 与现金流同期
+            try:
+                bs_df = self._cached_call("balancesheet", ts_code=ts_code)
+                bs_df = bs_df.sort_values("end_date", ascending=False) \
+                    if not bs_df.empty else bs_df
+            except Exception:                          # noqa: BLE001
+                bs_df = pd.DataFrame()
+
+            def _year_row(df, y):
+                if df is None or df.empty:
+                    return None
+                hit = df[df["end_date"].astype(str).str[:4] == y]
+                return hit.iloc[0] if len(hit) else None
+
             aa_vals = []
             for _, cf_row in annual_cf.head(aa_win).iterrows():
-                ocf_raw = cf_row.get("n_cashflow_act")
-                if ocf_raw is None or not pd.notna(ocf_raw):
-                    continue
-                capex_raw = cf_row.get("c_pay_acq_const_fiolta")
-                capex = abs(float(capex_raw)) if capex_raw is not None and pd.notna(capex_raw) else 0
-                # 非经常项（从利润表同年度取；字段缺失则计 0）
-                v_deduct = 0.0
-                v1 = 0.0
                 yr = str(cf_row["end_date"])[:4]
-                inc_hit = annual_inc[annual_inc["end_date"].astype(str).str[:4] == yr]
-                if len(inc_hit):
-                    ir = inc_hit.iloc[0]
-                    for c in ("non_oper_income", "oth_income"):
-                        rv = ir.get(c)
-                        if rv is not None and pd.notna(rv):
-                            v_deduct += float(rv)
-                aa_vals.append((float(ocf_raw) + v1 - v_deduct - capex) / 1e6)  # 百万元
+                inc_row = _year_row(annual_inc, yr)
+                bs_row = _year_row(bs_df, yr)
+                bs_prev = _year_row(bs_df, str(int(yr) - 1))
+                if bs_prev is None:
+                    bs_prev = bs_row
+                if inc_row is None or cf_row is None:
+                    continue
+
+                # ---- 真实现金收入（§17.3）----
+                S = _sf(inc_row.get("revenue")) or _sf(inc_row.get("营业收入"))
+                if S is None:
+                    continue
+
+                def _pick(d, *names):
+                    """按优先级取第一个非空值（兼容英文 Tushare 名 / 中文免费源名）。"""
+                    if d is None:
+                        return None
+                    for n in names:
+                        v = _sf(d.get(n))
+                        if v is not None:
+                            return v
+                    return None
+
+                T = 0.0    # AR 净增（扣除）
+                U = 0.0    # 预收净减（扣除）
+                ar_now = _pick(bs_row, "accounts_receiv", "应收账款")
+                ar_prev = _pick(bs_prev, "accounts_receiv", "应收账款")
+                if ar_now is not None and ar_prev is not None:
+                    T = ar_now - ar_prev
+                cl_now = _pick(bs_row, "contract_liab", "合同负债")
+                cl_prev = _pick(bs_prev, "contract_liab", "合同负债")
+                if cl_now is not None and cl_prev is not None:
+                    U = min(cl_now - cl_prev, 0.0)       # 仅净减扣，净增不加回
+                cash_rev = S - T - abs(U)
+
+                # ---- 经营性现金支出 W（§17.4）----
+                W1 = _pick(inc_row, "oper_cost", "营业成本") or 0.0
+                ap_now = _pick(bs_row, "acct_payable", "应付账款")
+                ap_prev = _pick(bs_prev, "acct_payable", "应付账款")
+                if ap_now is not None and ap_prev is not None:
+                    W1 += (ap_prev - ap_now)              # 应付净减 -> 多付现金
+                W2 = _pick(cf_row, "c_paid_to_for_empl", "支付给职工现金") or 0.0
+                W3 = _pick(inc_row, "income_tax", "所得税") or 0.0
+                W4 = _pick(inc_row, "fin_exp", "财务费用") or 0.0
+                W = W1 + W2 + W3 + W4
+
+                # ---- 总扣除 Y ----
+                capex = abs(_pick(cf_row, "c_pay_acq_const_fiolta", "资本开支") or 0.0)
+                Y = capex
+
+                # ---- 非经常性流入 V1 / V5 ----
+                v1 = _pick(cf_row, "c_disp_fiolta_recp", "处置固定资产收回") or 0.0
+                v5 = _pick(cf_row, "c_recp_return_invest", "取得投资收益收到") or 0.0
+
+                # ---- 字段完整度保护 ----
+                # 免费源的利润表缺 income_tax / fin_exp（值全 None）。
+                # 若 W3=W4=0，则 W 只剩「成本+应付」，会系统性【低估支出】
+                # 而【高估 AA】。此时改用 OCF 作为支出总额的上限约束：
+                #   AA ≈ min(真实现金收入, OCF) + V1 + V5 - Capex
+                # 其理由：OCF = 真实现金收入 - W（近似），故被 min 截住不会虚高。
+                if W3 == 0.0 and W4 == 0.0:
+                    ocf = _pick(cf_row, "n_cashflow_act", "经营活动现金流")
+                    if ocf is not None:
+                        bal = min(cash_rev, ocf) + v1 + v5 - Y
+                        caliber = "§17.5(OCF护)"
+                    else:
+                        bal = cash_rev + v1 + v5 - W - Y
+                        caliber = "§17.5(缺字段)"
+                else:
+                    bal = cash_rev + v1 + v5 - W - Y
+                    caliber = "§17.5(11步)"
+
+                aa_vals.append(bal / 1e6)                 # 百万元
+                aa_detail[yr] = bal / 1e6
+                result["AA_caliber"] = caliber
             if aa_vals:
                 AA = sum(aa_vals) / len(aa_vals)
 
         result["AA"] = AA
         result["AA_years"] = len(aa_vals) if aa_vals else 0
+        result["AA_detail"] = aa_detail
+        result.setdefault("AA_caliber", None)
 
         # R = AA × M / mkt_cap  (O=0, 无法区分回购用途)
         if AA is not None and result.get("M") is not None and mkt_cap > 0:

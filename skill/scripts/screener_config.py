@@ -82,6 +82,12 @@ class ScreenerConfig:
     # 未出现在表中的股票 = 无质押 = 放行。
     tier1_apply_pledge: bool = True
     tier1_max_pledge: float = 70.0    # 与 Tier2 的 max_pledge_pct 一致
+
+    # --- Tier 2: 是否重做质量门槛 ---
+    # 默认 False：ROE/毛利率/负债率 已在 Tier1 用全市场批量源筛过，
+    # Tier2 再判属重复（浪费 150 只 × 逐股请求）。
+    # 置 True 可恢复旧行为（调试 / 对比用）。
+    tier2_recheck_quality: bool = False
     # --- Tier 2: 框架粗算 R 否决门 ---
     # 用【精算 R（AA 口径）】再确认一次；Tier1 已用粗算 R 筛过。
     tier2_apply_R_veto: bool = False  # 默认关（Tier2 只 150 只，避免双重剔除）
