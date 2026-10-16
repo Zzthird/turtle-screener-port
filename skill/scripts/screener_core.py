@@ -460,6 +460,25 @@ class TushareScreener:
                                  f"=II×{cfg.tier1_R_floor_mult}")
                     print(_msg + "）")
 
+        # 6d. 【质押硬否决】质押比例 > tier1_max_pledge 则剔除
+        #     数据源：AkShare 全市场质押表（2294 行）。
+        #     仅包含有质押的股票，未出现 = 无质押 = 放行。
+        if cfg.tier1_apply_pledge and not main_df.empty:
+            try:
+                pl = self._backend.pledge_all()
+            except Exception:                          # noqa: BLE001
+                pl = None
+            if pl is not None and len(pl):
+                main_df["pledge_ratio"] = main_df["ts_code"].map(
+                    pl.set_index("ts_code")["pledge_ratio"])
+                before = len(main_df)
+                ok = main_df["pledge_ratio"].isna() | \
+                     (main_df["pledge_ratio"] <= cfg.tier1_max_pledge)
+                main_df = main_df[ok]
+                if os.environ.get("SCREENER_VERBOSE") == "1":
+                    print(f"  [Tier1 质押否决] {before} -> {len(main_df)} 只"
+                          f"（质押<={cfg.tier1_max_pledge}%）")
+
         # 7. Dividend yield > 0 — main channel only
         main_df = main_df[main_df["dv_ttm"].notna() & (main_df["dv_ttm"] > 0)].copy()
         main_df["channel"] = "main"

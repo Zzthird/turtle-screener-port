@@ -77,6 +77,11 @@ class ScreenerConfig:
     tier1_apply_R: bool = True
     tier1_R_floor_mult: float = 0.5   # 否决门：R ≥ II × 0.5（框架规则）
     tier1_R_rank: bool = True         # 排序是否改用 R_coarse（否则用原三因子打分）
+    # --- Tier 1: 质押硬否决（框架 Tier2 硬否决前移）---
+    # 数据源：AkShare stock_gpzy_pledge_ratio_em（全市场 2294 行，0.7s）
+    # 未出现在表中的股票 = 无质押 = 放行。
+    tier1_apply_pledge: bool = True
+    tier1_max_pledge: float = 70.0    # 与 Tier2 的 max_pledge_pct 一致
     # --- Tier 2: 框架粗算 R 否决门 ---
     # 用【精算 R（AA 口径）】再确认一次；Tier1 已用粗算 R 筛过。
     tier2_apply_R_veto: bool = False  # 默认关（Tier2 只 150 只，避免双重剔除）

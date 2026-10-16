@@ -89,6 +89,7 @@ class FreeScreenerBackend:
         self._fi_all: Optional[pd.DataFrame] = None   # 全市场财务指标
         self._debt_all: Optional[pd.DataFrame] = None  # 全市场资产负债率
         self._payout_all: Optional[pd.DataFrame] = None  # 全市场支付率
+        self._pledge_all: Optional[pd.DataFrame] = None  # 全市场质押比例
 
     def _akshare(self):
         if self._ak is None:
@@ -788,6 +789,38 @@ class FreeScreenerBackend:
             out = df[["ts_code", "payout_ratio", "dps", "net_profit"]].dropna(
                 subset=["payout_ratio"]).drop_duplicates("ts_code")
         self._payout_all = out
+        return out
+
+    # -- 全市场批量：AkShare 质押（Tier1 硬否决用）----------------------
+    def pledge_all(self) -> pd.DataFrame:
+        """全市场【股权质押比例】（AkShare stock_gpzy_pledge_ratio_em）。
+
+        实测 2026-10：一次返回 2294 行（仅【有质押】的股票），0.7s。
+        字段：股票代码 / 股票简称 / 质押比例(%) / 质押股数 / 交易日期
+
+        ⚠️ 只包含有质押的股票。未出现在表中的股票 = 无质押 = 视为 0%。
+
+        Returns: DataFrame[ts_code, pledge_ratio]
+        """
+        if getattr(self, "_pledge_all", None) is not None:
+            return self._pledge_all
+        out = pd.DataFrame()
+        try:
+            ak = self._akshare()
+            df = ak.stock_gpzy_pledge_ratio_em()
+            if df is not None and len(df):
+                df = pd.DataFrame(df)
+                code_col = next((c for c in df.columns if "代码" in str(c)), None)
+                pr_col = next((c for c in df.columns if "质押比例" in str(c)), None)
+                if code_col and pr_col:
+                    tmp = pd.DataFrame()
+                    tmp["ts_code"] = df[code_col].astype(str).str.zfill(6).map(self._to_ts)
+                    tmp["pledge_ratio"] = pd.to_numeric(df[pr_col], errors="coerce")
+                    out = tmp.dropna(subset=["pledge_ratio"]).drop_duplicates("ts_code")
+        except Exception as e:                        # noqa: BLE001
+            if self.verbose:
+                print(f"[free-backend] 质押数据失败: {str(e)[:80]}")
+        self._pledge_all = out
         return out
 
     # -- 单股财务指标 ---------------------------------------------------
