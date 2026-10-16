@@ -480,6 +480,9 @@ class TushareScreener:
                           f"（质押<={cfg.tier1_max_pledge}%）")
 
         # 7. Dividend yield > 0 — main channel only
+        #    ⚠️ dv_ttm 实际为【历史年均股息率】(pergx)，非最近 12 个月。
+        #       此项仅用于筛掉「从未分红」的公司（衡量分红历史/意愿）。
+        #       详见 _fetch_zhitu_dividend 的 docstring。
         main_df = main_df[main_df["dv_ttm"].notna() & (main_df["dv_ttm"] > 0)].copy()
         main_df["channel"] = "main"
 

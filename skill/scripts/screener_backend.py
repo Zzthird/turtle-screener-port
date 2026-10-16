@@ -534,6 +534,20 @@ class FreeScreenerBackend:
         端点: https://api.zhituapi.com/hitc/lsfh?token=XXX
         字段: dm(代码) mc(名称) pergx(年均股息%) totalgx(累计股息%) count(分红次数)
         实测: 500KB+ 全市场；免费 token 可用（体验版 1000 次/分钟）
+
+        ⚠️ 重要：输出的 `dv_ttm` 列名沿用 Tushare 习惯，但实际语义是
+           【历史年均股息率】(pergx)，**不是**最近 12 个月股息率。
+           实测 东方盛虹 pergx=0.97 / count=20（2000 年至今分过 20 次），
+           而其 2025 年报 fpfa='--'（当期不分配）—— 两者并不矛盾。
+
+           用途：仅用于 Tier1 第 7 步的「dv_ttm > 0」判断（筛掉从未分红的公司）。
+           衡量的是【分红连续性/历史意愿】，而非当期股息水平。
+           R 计算不受此值影响 —— 那里用 /hicw/yjbb 的 fpfa（当期分红方案）。
+
+           为什么不改成当期股息率：
+             影响面仅 3 只（实测 336→333），而核心 R 已用 fpfa；
+             改动需引入股价/送转处理，风险大于收益。
+             故保留现语义，仅在此处标明。
         """
         data = self._zt_get("/hitc/lsfh")
         try:
