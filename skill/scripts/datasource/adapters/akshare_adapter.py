@@ -351,7 +351,11 @@ class AkshareAdapter(DataSource):
             "固定资产净额": "fix_assets",
         },        "cash_flow": {
             "经营活动产生的现金流量净额": "ncf_from_oa",
-            "购建固定资产、无形资产和其他长期资产支付的现金": "cash_paid_for_assets",
+            # ⚠️ 科目名必须与 CASHFLOW_SINA_MAP 的 value 完全一致（含「所」字）。
+            #    雪球/智兔原始返回无「所」字（「...其他长期资产支付的现金」），
+            #    直接透传会匹配不上 → Capex 静默为 None → AA 走降级口径。
+            "购建固定资产、无形资产和其他长期资产所支付的现金":
+                "cash_paid_for_assets",
             "分配股利、利润或偿付利息所支付的现金": "cash_paid_of_distribution",
             "支付给职工以及为职工支付的现金": "cash_paid_to_employee_etc",
             "支付的各项税费": "payments_of_all_taxes",
@@ -468,7 +472,8 @@ class AkshareAdapter(DataSource):
         },
         "cashflow": {
             "经营活动产生的现金流量净额": "jyhdcsdxjlxj",
-            "购建固定资产、无形资产和其他长期资产支付的现金":
+            # ⚠️ 与 CASHFLOW_SINA_MAP 的 value 对齐（含「所」字）
+            "购建固定资产、无形资产和其他长期资产所支付的现金":
                 "gjgdzcwxzhqtqctzzfdxj",
             "分配股利、利润或偿付利息所支付的现金": "fpglrlhcllxzfdxj",
             "支付给职工以及为职工支付的现金": "zfgzyjwzgzfdxj",
