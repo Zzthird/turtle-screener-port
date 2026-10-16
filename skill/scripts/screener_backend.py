@@ -1026,6 +1026,69 @@ class FreeScreenerBackend:
         "曲线日期": "trade_date",
     }
 
+    @staticmethod
+    def _ths_weekly(ts_code: str) -> Optional[pd.DataFrame]:
+        """同花顺周线（30 年全历史，0.07s）—— 无风控，避开东财 push2his。
+
+        端点：https://d.10jqka.com.cn/v6/line/hs_{code}/{period}/last.js
+          period: 01=日 / 11=周 / 21=月
+        返回 JSONP：quotebridge_v6_line_hs_XXXXXX_11_last({...})
+          data 字段为 ";" 分隔的 CSV 行：日期,开,高,低,收,量,额,换手率,...
+          （实测周线/月线返回全历史；日线只给 num 根）
+
+        Returns: DataFrame[trade_date, 开盘价, 最高价, 最低价, 收盘价, 成交量, 成交额]
+                 （列名与 zzshare 路径一致，供 _extract_floor_price 消费）
+        """
+        import json as _json
+        import re as _re
+        import requests
+        sym = str(ts_code).split(".")[0].strip()
+        url = f"https://d.10jqka.com.cn/v6/line/hs_{sym}/11/last.js"
+        try:
+            r = requests.get(
+                url,
+                headers={"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                        "Chrome/131.0.0.0 Safari/537.36"),
+                         "Referer": "https://stockpage.10jqka.com.cn/"},
+                timeout=15,
+            )
+            txt = r.text or ""
+        except Exception:                             # noqa: BLE001
+            return None
+        if not txt:
+            return None
+        # 剥 JSONP：quotebridge_v6_line_hs_600887_11_last({...})
+        m = _re.search(r"\(\s*(\{.*\})\s*\)\s*;?\s*$", txt, _re.S)
+        if not m:
+            return None
+        try:
+            j = _json.loads(m.group(1))
+        except Exception:                             # noqa: BLE001
+            return None
+        raw = j.get("data") or ""
+        if not raw:
+            return None
+
+        recs = []
+        for line in raw.split(";"):
+            p = line.split(",")
+            if len(p) < 7:
+                continue
+            recs.append({
+                "trade_date": str(p[0])[:8],
+                "开盘价": p[1], "最高价": p[2], "最低价": p[3], "收盘价": p[4],
+                "成交量": p[5], "成交额": p[6],
+            })
+        if not recs:
+            return None
+        df = pd.DataFrame(recs)
+        for c in ("开盘价", "最高价", "最低价", "收盘价", "成交量", "成交额"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["收盘价"]).sort_values("trade_date")
+        df["end_date"] = df["trade_date"]
+        return df.reset_index(drop=True)
+
     def _zzshare_weekly(self, ts_code: str, years: int = 4) -> pd.DataFrame:
         """zzshare 日线聚合为周线（无风控，避开东财 push2his）。
 
@@ -1150,6 +1213,13 @@ class FreeScreenerBackend:
         #   zzshare 日线：0.4s/1000 条，无风控，上限 1000 条/请求
         #   → 分页 3 次拿 8 年（~2000 交易日）后聚合成周线。
         if api_name == "weekly":
+            # 周线：zzshare 日线聚合（不复权，4 年）。
+            #
+            # ⚠️ 曾试同花顺 d.10jqka.com.cn/.../11/last.js（30 年、全历史），
+            #    但它返回的是【前复权】价 —— 伊利周线历史最低为 -10.57，
+            #    用作「历史最低价」会直接算成负数，底价失真。
+            #    zzshare 聚合的是不复权价（实测伊利最低 21.57），与
+            #    东财「不复权」口径一致，故定为主源。
             return self._zzshare_weekly(ts_code, years=4)
 
         # ⚠️ datasource.get(source="auto") 是按【适配器注册顺序】降级，
