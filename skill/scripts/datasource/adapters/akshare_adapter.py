@@ -43,6 +43,25 @@ def _to_em(code: str) -> str:
     return mkt.upper() + num
 
 
+def _num_or_none(v):
+    """把源返回的字符串/空值统一转成 float 或 None。
+
+    同花顺（AkShare 封装）的 value 列是【字符串】（如 "115393310976.6900"），
+    需转 float；"--"/""/None/NaN 一律当缺失。
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return None if v != v else float(v)          # NaN -> None
+    s = str(v).strip().replace(",", "")
+    if s in ("", "--", "-", "None", "nan", "NaN"):
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
 @register
 class AkshareAdapter(DataSource):
     name = "akshare"
@@ -119,10 +138,391 @@ class AkshareAdapter(DataSource):
 
     # -- 三大报表（新浪）------------------------------------------------
     def _fetch_income(self, code, periods, limit, **kw):
+        ak = self._get_ak()
+        # 0) 新浪 openapi（0.14s，77 科目，含银行）
+        try:
+            rows = self._sina_openapi_income(code, periods, limit)
+            if rows:
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 1) 同花顺（AkShare 封装，0.20s）
+        try:
+            rows = self._ths_new_report(code, "benefit", periods, limit)
+            if rows:
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 2) 东财
+        try:
+            df = ak.stock_profit_sheet_by_report_em(symbol=_to_em(code))
+            if df is not None and len(df):
+                rows = self._annualize(df.to_dict("records"), AF.PERIOD_COL_EM, periods)
+                for r in rows:
+                    r["end_date"] = str(r.get(AF.PERIOD_COL_EM, ""))[:10].replace("-", "")
+                return rows[:limit]
+        except Exception:                             # noqa: BLE001
+            pass
+        # 3) 雪球（0.11s，需 token）
+        try:
+            rows = self._xueqiu_report(code, "income", periods, limit)
+            if rows:
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 4) 智兔（0.24s，拼音字段）
+        try:
+            rows = self._zhitu_report(code, "income", periods, limit)
+            if rows:
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 5) 新浪（AkShare 旧路径）
         return self._sina_report(code, "income", "利润表", AF.PERIOD_COL_SINA, periods, limit)
 
     def _fetch_balancesheet(self, code, periods, limit, **kw):
+        ak = self._get_ak()
+        # 0) 新浪 openapi（0.20s，141 科目，含银行）
+        try:
+            rows = self._sina_openapi_balance(code, periods, limit)
+            if rows:
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 1) 同花顺（AkShare 封装，0.20s）
+        try:
+            rows = self._ths_new_report(code, "debt", periods, limit)
+            if rows:
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 2) 东财
+        try:
+            df = ak.stock_balance_sheet_by_report_em(symbol=_to_em(code))
+            if df is not None and len(df):
+                rows = self._annualize(df.to_dict("records"), AF.PERIOD_COL_EM, periods)
+                for r in rows:
+                    r["end_date"] = str(r.get(AF.PERIOD_COL_EM, ""))[:10].replace("-", "")
+                return rows[:limit]
+        except Exception:                             # noqa: BLE001
+            pass
+        # 3) 雪球（0.11s，需 token）
+        try:
+            rows = self._xueqiu_report(code, "balance", periods, limit)
+            if rows:
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 4) 智兔（0.24s，拼音字段）
+        try:
+            rows = self._zhitu_report(code, "balance", periods, limit)
+            if rows:
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 5) 新浪（AkShare 旧路径）
         return self._sina_report(code, "balancesheet", "资产负债表", AF.PERIOD_COL_SINA, periods, limit)
+
+    # -- 同花顺（AkShare 封装）利润表 / 资产负债表 ------------------
+    # 同花顺是【长表】（metric_name / value），需 pivot 成宽表。
+    # 数值均为【字符串】，需转 float。
+    # 字段名为同花顺自造英文；已验证 2024 伊利：
+    #   营业总收入 1153.93亿 / 归母净利 84.53亿 / 总资产 1537.18亿 /
+    #   总负债 967.10亿（total_debt）/ 负债率 62.91% —— 与东财一致。
+    _THS_METRIC_MAP = {
+        # 利润表
+        "benefit": {
+            "营业总收入": "operating_income",
+            "营业收入": "operating_income_total",
+            "营业成本": "operating_costs",
+            "营业税金及附加": "taxes_and_surcharges",
+            "销售费用": "sales_fee",
+            "管理费用": "manage_fee",
+            "研发费用": "research_and_development_expenses",
+            "财务费用": "financial_interest_expenses",
+            "投资收益": "invest_income",
+            "营业利润": "operating_profit",
+            "利润总额": "profit_total",
+            "所得税费用": "income_tax_expense",
+            "净利润": "net_profit",
+            "归属于母公司所有者的净利润": "parent_holder_net_profit",
+            "营业外收入": "non_operating_income",
+            "营业外支出": "non_operating_expenses",
+            "基本每股收益": "basic_eps",
+        },
+        # 资产负债表
+        "debt": {
+            "货币资金": "cash",
+            "交易性金融资产": "trading_financial_assets",
+            "应收账款": "accounts_receivable",
+            "应收票据": "notes_receivable",
+            "预付款项": "prepayments",
+            "存货": "inventory",
+            "商誉": "goodwill",
+            "资产总计": "assets_total",
+            "负债合计": "total_debt",
+            "应付账款": "accounts_payable",
+            "预收款项": "advance_receipts",
+            "合同负债": "contract_debt",
+            "流动资产合计": "total_current_assets",
+            "固定资产净额": "fixed_assets",
+        },
+    }
+
+    def _ths_new_report(self, code, table: str, periods, limit: int) -> list[dict]:
+        """同花顺（AkShare 封装）利润表/资产负债表 -> 中文列名行。
+
+        table: "benefit"（利润表） | "debt"（资产负债表）
+        长表 pivot 成宽表，只保留年报（12-31）。
+        """
+        ak = self._get_ak()
+        fn = (ak.stock_financial_benefit_new_ths if table == "benefit"
+              else ak.stock_financial_debt_new_ths)
+        sym = _strip_prefix(code)
+        df = fn(symbol=sym, indicator="按年度")
+        if df is None or len(df) == 0:
+            return []
+        need = self._THS_METRIC_MAP.get(table) or {}
+        # 只保留映射表里认识的 metric（need 是 {中文: 英文}，比对英文那侧）
+        known = set(need.values())
+        keep = {m for m in df["metric_name"].dropna().unique() if m in known}
+        if not keep:
+            return []
+        sub = df[df["metric_name"].isin(keep)].copy()
+        sub["report_date"] = sub["report_date"].astype(str)
+        sub = sub[sub["report_date"].str.endswith("12-31")]
+        if sub.empty:
+            return []
+        wanted = None
+        if periods:
+            wanted = {str(p).replace("-", "")[:8] for p in periods}
+        # pivot: index=report_date, columns=metric_name
+        piv = sub.pivot_table(index="report_date", columns="metric_name",
+                              values="value", aggfunc="first")
+        out = []
+        for rd, row in piv.sort_index(ascending=False).iterrows():
+            ed = rd.replace("-", "")
+            if wanted is not None and ed not in wanted:
+                continue
+            rec: dict = {"报表日期": ed, "end_date": ed}
+            for cn, metric in need.items():
+                v = row.get(metric)
+                rec[cn] = _num_or_none(v)
+            out.append(rec)
+        return out[:limit]
+
+    # -- 雪球（pysnowball 端点）三表 ---------------------------------
+    # ⚠️ 雪球是【宽表】而非新浪式的 item_title 列表：
+    #    list[i] = {report_name, report_date, 字段: [值, yoy], ...}
+    #    值取 [0]，yoy 取 [1]；无值时为 null。
+    #  需 cookie xq_a_token（可用 XQ_TOKEN 环境变量 / config 覆盖）。
+    #  实测 0.11s/表（最快），但 Token 会过期 → 仅作轮换位之一。
+    _XQ_MAP = {
+        "income": {
+            "营业总收入": "total_revenue",
+            "营业收入": "revenue",
+            "营业成本": "operating_cost",
+            "营业税金及附加": "operating_taxes_and_surcharge",
+            "销售费用": "sales_fee",
+            "管理费用": "manage_fee",
+            "研发费用": "rad_cost",
+            "财务费用": "financing_expenses",
+            "投资收益": "invest_income",
+            "营业利润": "op",
+            "利润总额": "profit_total_amt",
+            "所得税费用": "income_tax_expenses",
+            "净利润": "net_profit",
+            "归属于母公司所有者的净利润": "net_profit_atsopc",
+            "营业外收入": "non_operating_income",
+            "营业外支出": "non_operating_payout",
+            "基本每股收益": "basic_eps",
+        },
+        "balance": {
+            "货币资金": "currency_funds",
+            "应收账款": "account_receivable",
+            "应付账款": "accounts_payable",
+            "预付款项": "pre_payment",
+            "存货": "inventory",
+            "商誉": "good_will",
+            "资产总计": "total_assets",
+            "负债合计": "total_liab",
+            "合同负债": "contract_liabilities",
+            "流动资产合计": "total_current_assets",
+            "固定资产净额": "fix_assets",
+        },        "cash_flow": {
+            "经营活动产生的现金流量净额": "ncf_from_oa",
+            "购建固定资产、无形资产和其他长期资产支付的现金": "cash_paid_for_assets",
+            "分配股利、利润或偿付利息所支付的现金": "cash_paid_of_distribution",
+            "支付给职工以及为职工支付的现金": "cash_paid_to_employee_etc",
+            "支付的各项税费": "payments_of_all_taxes",
+            "销售商品、提供劳务收到的现金": "cash_received_of_sales_service",
+            "购买商品、接受劳务支付的现金": "goods_buy_and_service_cash_pay",
+            "投资活动产生的现金流量净额": "ncf_from_ia",
+            "取得投资收益收到的现金": "invest_income_cash_received",
+            "处置固定资产、无形资产和其他长期资产所收回的现金净额": "net_cash_of_disposal_assets",
+        },
+    }
+
+    @staticmethod
+    def _xq_token() -> str:
+        """雪球 token：环境变量 XQ_TOKEN 优先，其次项目 config。"""
+        import os
+        t = (os.environ.get("XQ_TOKEN") or "").strip()
+        if t:
+            return t
+        try:
+            import config                                 # type: ignore
+            return str(getattr(config, "XQ_TOKEN", "") or "").strip()
+        except Exception:                                 # noqa: BLE001
+            return ""
+
+    @classmethod
+    def _xueqiu_report(cls, code: str, table: str, periods, limit: int) -> list[dict]:
+        """雪球三表 -> 中文列名行（宽表直接用）。
+
+        table: income | balance | cash_flow
+        """
+        import requests
+        token = cls._xq_token()
+        if not token:
+            return []
+        num, mkt = (code.split(".") + ["SH"])[:2] if "." in code else (code, "SH")
+        sym = f"{mkt.upper()}{num}"
+        url = f"https://stock.xueqiu.com/v5/stock/finance/cn/{table}.json"
+        r = requests.get(
+            url,
+            params={"symbol": sym, "type": "Q4", "is_detail": "true",
+                    "count": str(max(5, (limit or 8)))},
+            headers={"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/131.0.0.0 Safari/537.36"),
+                     "Cookie": f"xq_a_token={token}"},
+            timeout=15,
+        )
+        j = r.json() or {}
+        lst = ((j.get("data") or {}).get("list")) or []
+        if not lst:
+            return []
+        need = cls._XQ_MAP.get(table) or {}
+        wanted = None
+        if periods:
+            wanted = {str(p).replace("-", "")[:8] for p in periods}
+        out = []
+        for item in lst:
+            # 雪球 report_date 是毫秒时间戳（UTC），转北京时间后才是 12-31；
+            # report_name 形如「2024年报」更可靠，优先用它。
+            rname = str(item.get("report_name") or "")
+            if "年报" in rname:
+                rd = "".join(ch for ch in rname if ch.isdigit())[:4] + "1231"
+            else:
+                raw = item.get("report_date")
+                try:
+                    import datetime as _d
+                    rd = _d.datetime.fromtimestamp(int(raw) / 1000).strftime("%Y%m%d")
+                except Exception:                     # noqa: BLE001
+                    rd = ""
+            if not rd.endswith("1231"):
+                continue
+            if wanted is not None and rd not in wanted:
+                continue
+            rec: dict = {"报表日期": rd, "end_date": rd}
+            for cn, field in need.items():
+                raw = item.get(field)
+                if isinstance(raw, (list, tuple)):
+                    raw = raw[0] if raw else None
+                rec[cn] = _num_or_none(raw)
+            out.append(rec)
+        out.sort(key=lambda x: x["end_date"], reverse=True)
+        return out[:limit]
+
+    # -- 智兔（拼音字段）三表 ---------------------------------------
+    # 端点：/hs/fin/{income|balance|cashflow}/{code}?token=xxx
+    #   ★ code 在【路径】里，不是 query 参数（写成 query 会 404）。
+    # 特点：一次返回【全历史】（1995 起，129-249KB），故本地筛年报后
+    #       只取 limit 条；字段为拼音缩写，靠数值对照反推确认。
+    # 实测（伊利 2025 年报）全部字段与真值一致。
+    _ZT_MAP = {
+        "income": {
+            "营业总收入": "yyzsr",
+            "营业收入": "yysr",
+            "营业成本": "yycb",
+            "营业税金及附加": "yysjjfj",
+            "销售费用": "xsfy",
+            "管理费用": "glfy",
+            "财务费用": "cwfy",
+            "投资收益": "tzsy",
+            "营业利润": "yylr",
+            "利润总额": "lrze",
+            "净利润": "jlr",
+            "归属于母公司所有者的净利润": "gsmgsyzzdjlr",
+            "营业外收入": "ywsr",
+            "营业外支出": "ywzc",
+        },
+        "balance": {
+            "货币资金": "hbzj",
+            "应收账款": "yszk",
+            "存货": "ch",
+            "资产总计": "zczj",
+            "负债合计": "fzhj",
+            "合同负债": "ysk",
+        },
+        "cashflow": {
+            "经营活动产生的现金流量净额": "jyhdcsdxjlxj",
+            "购建固定资产、无形资产和其他长期资产支付的现金":
+                "gjgdzcwxzhqtqctzzfdxj",
+            "分配股利、利润或偿付利息所支付的现金": "fpglrlhcllxzfdxj",
+            "支付给职工以及为职工支付的现金": "zfgzyjwzgzfdxj",
+            "支付的各项税费": "zfdgxsf",
+            "销售商品、提供劳务收到的现金": "xssptglwsddxj",
+            "购买商品、接受劳务支付的现金": "gmspjslwzfdxj",
+            "投资活动产生的现金流量净额": "tzhdcsdxjlxj",
+            "处置固定资产、无形资产和其他长期资产所收回的现金净额":
+                "czgdzcwxzhqtqctzssddxj",
+            "取得投资收益收到的现金": "qdtzsysddxj",
+        },
+    }
+
+    @classmethod
+    def _zhitu_report(cls, code: str, table: str, periods, limit: int) -> list[dict]:
+        """智兔三表 -> 中文列名行。
+
+        table: income | balance | cashflow
+        """
+        import os
+        import requests
+        tok = (os.environ.get("ZHITU_TOKEN") or "").strip()
+        if not tok:
+            try:
+                import config                             # type: ignore
+                tok = str(getattr(config, "ZHITU_TOKEN", "") or "").strip()
+            except Exception:                             # noqa: BLE001
+                tok = ""
+        if not tok:
+            return []
+        r = requests.get(
+            f"https://api.zhituapi.com/hs/fin/{table}/{code}",
+            params={"token": tok}, timeout=25,
+        )
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return []
+        need = cls._ZT_MAP.get(table) or {}
+        wanted = None
+        if periods:
+            wanted = {str(p).replace("-", "")[:8] for p in periods}
+        rows = []
+        for d in data:
+            rd = str(d.get("jzrq") or "").replace("-", "")[:8]
+            if not rd.endswith("1231"):
+                continue
+            if wanted is not None and rd not in wanted:
+                continue
+            rec: dict = {"报表日期": rd, "end_date": rd}
+            for cn, field in need.items():
+                rec[cn] = _num_or_none(d.get(field))
+            rows.append(rec)
+        rows.sort(key=lambda x: x["end_date"], reverse=True)
+        return rows[:limit]
 
     def _sina_report(self, code, api, symbol, period_col, periods, limit) -> list[dict]:
         ak = self._get_ak()
@@ -169,7 +569,21 @@ class AkshareAdapter(DataSource):
                 return rows[:limit]
         except Exception:                             # noqa: BLE001
             pass
-        # 3) 新浪（AkShare 旧路径）降级
+        # 3) 雪球（0.11s，需 token）
+        try:
+            rows = self._xueqiu_report(code, "cash_flow", periods, limit)
+            if rows and self._cashflow_usable(rows):
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 4) 智兔（0.24s，拼音字段）
+        try:
+            rows = self._zhitu_report(code, "cashflow", periods, limit)
+            if rows and self._cashflow_usable(rows):
+                return rows
+        except Exception:                             # noqa: BLE001
+            pass
+        # 5) 新浪（AkShare 旧路径）降级
         rows = self._sina_report(code, "cashflow", "现金流量表", AF.PERIOD_COL_SINA, periods, limit)
         return rows
 
@@ -259,6 +673,52 @@ class AkshareAdapter(DataSource):
                     r.get("支付的其他与经营活动有关的现金"),
                 "end_date": ed,
             })
+        out.sort(key=lambda x: x["end_date"], reverse=True)
+        return out[:limit]
+
+    @classmethod
+    def _sina_openapi_income(cls, code: str, periods, limit: int) -> list[dict]:
+        """新浪 openapi 利润表 -> 中文列名行（与映射层 AKSHARE INCOME_MAP 对齐）。
+
+        实测（600887）：77 个科目，含营业总收入/成本/所得税费用/财务费用/
+        投资收益/归属于母公司所有者的净利润 等 AA 所需字段。
+
+        注：输出【中文列名】而非 Tushare 英文名 ——
+            field_overrides 会按 dataset_name 选 INCOME_MAP（中文->中文），
+            故适配器必须给映射层同样的中文 key。
+        """
+        return cls._sina_openapi_generic(code, "lrb", periods, limit)
+
+    @classmethod
+    def _sina_openapi_balance(cls, code: str, periods, limit: int) -> list[dict]:
+        """新浪 openapi 资产负债表 -> 中文列名行（与 BALANCE_MAP 对齐）。"""
+        return cls._sina_openapi_generic(code, "fzb", periods, limit)
+
+    @classmethod
+    def _sina_openapi_generic(cls, code: str, report_type: str, periods,
+                              limit: int) -> list[dict]:
+        """新浪 openapi 通用取表：拉全科目后只保留年报（12-31）。
+
+        输出【中文科目名】——映射层（akshare_fields.INCOME_MAP/BALANCE_MAP）
+        的 key 也是中文，故直接透传即可；不需做英文回译。
+        """
+        rows = cls._sina_openapi_report(code, report_type,
+                                        num=max(8, (limit or 8)))
+        if not rows:
+            return []
+        wanted = None
+        if periods:
+            wanted = {str(p).replace("-", "")[:8] for p in periods}
+        out = []
+        for r in rows:
+            ed = str(r.get("end_date") or "")
+            if not ed.endswith("1231"):
+                continue
+            if wanted is not None and ed not in wanted:
+                continue
+            rec = dict(r)                            # 已含中文科目 + end_date
+            rec["报表日期"] = ed
+            out.append(rec)
         out.sort(key=lambda x: x["end_date"], reverse=True)
         return out[:limit]
 
