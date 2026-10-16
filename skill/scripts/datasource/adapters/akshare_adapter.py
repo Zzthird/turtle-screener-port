@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+import pandas as pd
+
 from ..base import DataSource, DataSourceError, register
 from . import akshare_fields as AF
 
@@ -43,6 +45,24 @@ def _to_em(code: str) -> str:
     return mkt.upper() + num
 
 
+def _rotated(pool: list, idx: int) -> list:
+    """把源池从 idx 处循环重排（轮换调度）。
+
+    为何需要：固定降级顺位会让主源承担全部请求（如 333 只全走新浪），
+    单源压力集中且易触发风控。轮换后每源只需承担 1/N。
+
+    例（pool=[A,B,C,D,E,F]）：
+      idx=0 → [A,B,C,D,E,F]
+      idx=1 → [B,C,D,E,F,A]
+      idx=6 → [A,B,C,D,E,F]
+    重排后仍按顺序尝试，失败自动降级 —— 轮换与降级兼得。
+    """
+    if not pool:
+        return pool
+    s = int(idx) % len(pool)
+    return list(pool[s:]) + list(pool[:s])
+
+
 def _num_or_none(v):
     """把源返回的字符串/空值统一转成 float 或 None。
 
@@ -65,6 +85,28 @@ def _num_or_none(v):
 @register
 class AkshareAdapter(DataSource):
     name = "akshare"
+
+    # ── 轮换调度：当前股票序号 ────────────────────────────
+    # 由 screener 在 Tier2 主循环中 set()，各 _fetch_* 读取后决定
+    # 源池从哪个源开始。用 contextvars 而非参数透传：
+    # ctx -> _free_call -> dataset_call -> get -> adapter 链路长，
+    # 逐层加参数要改 6 处签名，contextvar 只需改 2 处。
+    _CUR_IDX: "contextvars.ContextVar[int]" = None    # 在 __init__ 后设置
+
+    @classmethod
+    def set_rotation_index(cls, idx: int) -> None:
+        """由 screener 调用：设置当前股票的轮换序号。"""
+        import contextvars
+        if cls._CUR_IDX is None:
+            cls._CUR_IDX = contextvars.ContextVar("akshare_rot_idx", default=0)
+        cls._CUR_IDX.set(int(idx))
+
+    @classmethod
+    def _rot_idx(cls) -> int:
+        import contextvars
+        if cls._CUR_IDX is None:
+            cls._CUR_IDX = contextvars.ContextVar("akshare_rot_idx", default=0)
+        return int(cls._CUR_IDX.get() or 0)
     priority = 30
     supports_hk = True
     supports_us = False
@@ -137,91 +179,118 @@ class AkshareAdapter(DataSource):
         return {}
 
     # -- 三大报表（新浪）------------------------------------------------
-    def _fetch_income(self, code, periods, limit, **kw):
+    # ── 轮换池：每表一组可轮换的源 ────────────────────
+    # 每个 _fetch_* 按 _rot_idx() 从不同源开始，失败自动降级。
+    # 首次全量跑：每源承担 ~333/N 次；重跑全命中缓存 → 0 请求。
+    # 源池顺序 = 降级优先级（越靠前越快/越稳）。
+    #
+    # ⚠️ 为何排除两个源：
+    #   1) 东财（em）—— 已作为 _src_* 实现但【未入池】：
+    #      a. 慢，2-4s/表（其他源 0.1-0.3s）
+    #      b. field_overrides 里【只有现金流量表有东财映射表】
+    #         （CASHFLOW_EM_MAP），利润表/资产负债表缺 INCOME_EM_MAP /
+    #         BALANCE_EM_MAP → 列名无法回译成中文业务名 →
+    #         实测茅台走东财后 revenue 全为 None → AA 算不出（years=0）。
+    #   2) 智兔（zhitu）—— 额度极小（当日数十次即 429），
+    #      且三表字段有缺（所得税费用/应付账款），单独跑会降级到
+    #      「§17.5(OCF护)」口径（五粮液 AA 35,262 → 31,823，偏差 9.8%）。
+    #    两者仍保留在 _src_* 中，可手动指定 source= 使用。
+    _INCOME_SRCS = ("sina_openapi", "ths_new", "xq", "sina_ak")
+    _BALANCE_SRCS = ("sina_openapi", "ths_new", "xq", "sina_ak")
+    _CASHFLOW_SRCS = ("sina_openapi", "ths_new", "xq", "sina_ak")
+
+    def _src_income(self, name, code, periods, limit):
         ak = self._get_ak()
-        # 0) 新浪 openapi（0.14s，77 科目，含银行）
-        try:
-            rows = self._sina_openapi_income(code, periods, limit)
-            if rows:
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 1) 同花顺（AkShare 封装，0.20s）
-        try:
-            rows = self._ths_new_report(code, "benefit", periods, limit)
-            if rows:
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 2) 东财
-        try:
+        if name == "sina_openapi":
+            return self._sina_openapi_income(code, periods, limit)
+        if name == "ths_new":
+            return self._ths_new_report(code, "benefit", periods, limit)
+        if name == "em":
             df = ak.stock_profit_sheet_by_report_em(symbol=_to_em(code))
-            if df is not None and len(df):
-                rows = self._annualize(df.to_dict("records"), AF.PERIOD_COL_EM, periods)
-                for r in rows:
-                    r["end_date"] = str(r.get(AF.PERIOD_COL_EM, ""))[:10].replace("-", "")
-                return rows[:limit]
-        except Exception:                             # noqa: BLE001
-            pass
-        # 3) 雪球（0.11s，需 token）
-        try:
-            rows = self._xueqiu_report(code, "income", periods, limit)
-            if rows:
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 4) 智兔（0.24s，拼音字段）
-        try:
-            rows = self._zhitu_report(code, "income", periods, limit)
-            if rows:
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 5) 新浪（AkShare 旧路径）
-        return self._sina_report(code, "income", "利润表", AF.PERIOD_COL_SINA, periods, limit)
+            if df is None or not len(df):
+                return []
+            rows = self._annualize(df.to_dict("records"), AF.PERIOD_COL_EM, periods)
+            for r in rows:
+                r["end_date"] = str(r.get(AF.PERIOD_COL_EM, ""))[:10].replace("-", "")
+            return rows[:limit]
+        if name == "xq":
+            return self._xueqiu_report(code, "income", periods, limit)
+        if name == "zhitu":
+            return self._zhitu_report(code, "income", periods, limit)
+        if name == "sina_ak":
+            return self._sina_report(code, "income", "利润表", AF.PERIOD_COL_SINA,
+                                     periods, limit)
+        return []
+
+    def _src_balance(self, name, code, periods, limit):
+        ak = self._get_ak()
+        if name == "sina_openapi":
+            return self._sina_openapi_balance(code, periods, limit)
+        if name == "ths_new":
+            return self._ths_new_report(code, "debt", periods, limit)
+        if name == "em":
+            df = ak.stock_balance_sheet_by_report_em(symbol=_to_em(code))
+            if df is None or not len(df):
+                return []
+            rows = self._annualize(df.to_dict("records"), AF.PERIOD_COL_EM, periods)
+            for r in rows:
+                r["end_date"] = str(r.get(AF.PERIOD_COL_EM, ""))[:10].replace("-", "")
+            return rows[:limit]
+        if name == "xq":
+            return self._xueqiu_report(code, "balance", periods, limit)
+        if name == "zhitu":
+            return self._zhitu_report(code, "balance", periods, limit)
+        if name == "sina_ak":
+            return self._sina_report(code, "balancesheet", "资产负债表",
+                                     AF.PERIOD_COL_SINA, periods, limit)
+        return []
+
+    def _src_cashflow(self, name, code, periods, limit):
+        ak = self._get_ak()
+        if name == "sina_openapi":
+            return self._sina_openapi_cashflow(code, periods, limit)
+        if name == "ths_new":
+            return self._ths_cashflow(code, periods, limit)
+        if name == "em":
+            df = ak.stock_cash_flow_sheet_by_report_em(symbol=_to_em(code))
+            if df is None or not len(df):
+                return []
+            rows = self._annualize(df.to_dict("records"), AF.PERIOD_COL_EM, periods)
+            for r in rows:
+                r["end_date"] = str(r.get(AF.PERIOD_COL_EM, ""))[:10].replace("-", "")
+            return rows[:limit]
+        if name == "xq":
+            return self._xueqiu_report(code, "cash_flow", periods, limit)
+        if name == "zhitu":
+            return self._zhitu_report(code, "cashflow", periods, limit)
+        if name == "sina_ak":
+            return self._sina_report(code, "cashflow", "现金流量表",
+                                     AF.PERIOD_COL_SINA, periods, limit)
+        return []
+
+    def _fetch_income(self, code, periods, limit, **kw):
+        """利润表：6 源轮换 + 逐源降级。"""
+        order = _rotated(list(self._INCOME_SRCS), self._rot_idx())
+        for name in order:
+            try:
+                rows = self._src_income(name, code, periods, limit)
+                if rows:
+                    return rows
+            except Exception:                         # noqa: BLE001
+                continue
+        return []
 
     def _fetch_balancesheet(self, code, periods, limit, **kw):
-        ak = self._get_ak()
-        # 0) 新浪 openapi（0.20s，141 科目，含银行）
-        try:
-            rows = self._sina_openapi_balance(code, periods, limit)
-            if rows:
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 1) 同花顺（AkShare 封装，0.20s）
-        try:
-            rows = self._ths_new_report(code, "debt", periods, limit)
-            if rows:
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 2) 东财
-        try:
-            df = ak.stock_balance_sheet_by_report_em(symbol=_to_em(code))
-            if df is not None and len(df):
-                rows = self._annualize(df.to_dict("records"), AF.PERIOD_COL_EM, periods)
-                for r in rows:
-                    r["end_date"] = str(r.get(AF.PERIOD_COL_EM, ""))[:10].replace("-", "")
-                return rows[:limit]
-        except Exception:                             # noqa: BLE001
-            pass
-        # 3) 雪球（0.11s，需 token）
-        try:
-            rows = self._xueqiu_report(code, "balance", periods, limit)
-            if rows:
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 4) 智兔（0.24s，拼音字段）
-        try:
-            rows = self._zhitu_report(code, "balance", periods, limit)
-            if rows:
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 5) 新浪（AkShare 旧路径）
-        return self._sina_report(code, "balancesheet", "资产负债表", AF.PERIOD_COL_SINA, periods, limit)
+        """资产负债表：6 源轮换 + 逐源降级。"""
+        order = _rotated(list(self._BALANCE_SRCS), self._rot_idx())
+        for name in order:
+            try:
+                rows = self._src_balance(name, code, periods, limit)
+                if rows:
+                    return rows
+            except Exception:                         # noqa: BLE001
+                continue
+        return []
 
     # -- 同花顺（AkShare 封装）利润表 / 资产负债表 ------------------
     # 同花顺是【长表】（metric_name / value），需 pivot 成宽表。
@@ -232,14 +301,26 @@ class AkshareAdapter(DataSource):
     _THS_METRIC_MAP = {
         # 利润表
         "benefit": {
-            "营业总收入": "operating_income",
-            "营业收入": "operating_income_total",
+            # ⚠️ 同花顺这两个字段的含义与字面相反（实测茅台/工行/宁德均如此）：
+            #    operating_income       = 营业收入（主营，不含利息/保费等）
+            #    operating_income_total = 营业总收入（含利息收入等）
+            #  原实现写反，导致 AA 的 S（真实现金收入的起点）取错：
+            #  茅台 2024 总收 1741.44 亿 / 营收 1708.99 亿，取错则 AA 偏高 3.07%。
+            "营业总收入": "operating_income_total",
+            "营业收入": "operating_income",
             "营业成本": "operating_costs",
             "营业税金及附加": "taxes_and_surcharges",
             "销售费用": "sales_fee",
             "管理费用": "manage_fee",
             "研发费用": "research_and_development_expenses",
-            "财务费用": "financial_interest_expenses",
+            # ⚠️ 同花顺【没有】单独的「财务费用」字段。
+            #    financial_interest_expenses 只是【利息支出】（借钱利息），
+            #    漏掉利息收入（存款利息）——对现金充裕的公司影响巨大：
+            #    五粮液 2025 利息支出 0.29 亿 vs 利息收入 26.93 亿，
+            #    财务费用真值 = -26.65 亿（新浪）。若直接用
+            #    financial_interest_expenses 会得到 +0.29 亿 → 符号都反了
+            #    → AA 的 W4 凭空多记一笔巨额支出。
+            #    故此处【不映射】，改在 _ths_new_report 里做差值。
             "投资收益": "invest_income",
             "营业利润": "operating_profit",
             "利润总额": "profit_total",
@@ -289,6 +370,26 @@ class AkshareAdapter(DataSource):
         if not keep:
             return []
         sub = df[df["metric_name"].isin(keep)].copy()
+        # 财务费用特例：同花顺无此字段，用【利息支出 − 利息收入】合成。
+        #   ⚠️ 局限：合成式只含利息，不含汇兑损益/手续费等 ——
+        #   对有外汇/衍生工具的公司会偏。实测美的集团 2025：
+        #   同花顺合成 -62.33 亿 vs 新浪真值 -59.04 亿（差 3.29 亿）
+        #   → AA 偏差 +0.21%（可接受）。
+        #   若未来偏差扩大，可考虑仅在无其他源时启用同花顺路径。
+        fin_series = None
+        if table == "benefit":
+            extra = df[df["metric_name"].isin(
+                ["financial_interest_expenses", "financial_interest_income"])].copy()
+            if len(extra):
+                extra["report_date"] = extra["report_date"].astype(str)
+                px = extra.pivot_table(index="report_date", columns="metric_name",
+                                       values="value", aggfunc="first")
+                ie = pd.to_numeric(px.get("financial_interest_expenses"),
+                                   errors="coerce").fillna(0.0)
+                ii = pd.to_numeric(px.get("financial_interest_income"),
+                                   errors="coerce").fillna(0.0)
+                fin_series = (ie - ii)
+                fin_series.index = fin_series.index.astype(str)
         sub["report_date"] = sub["report_date"].astype(str)
         sub = sub[sub["report_date"].str.endswith("12-31")]
         if sub.empty:
@@ -308,6 +409,13 @@ class AkshareAdapter(DataSource):
             for cn, metric in need.items():
                 v = row.get(metric)
                 rec[cn] = _num_or_none(v)
+            # 财务费用：同花顺无此字段，用合成的值补上
+            if fin_series is not None:
+                rk = rd if rd in fin_series.index else rd.replace("-", "")[:4] + "-12-31"
+                try:
+                    rec["财务费用"] = _num_or_none(fin_series.get(rk))
+                except Exception:                     # noqa: BLE001
+                    pass
             out.append(rec)
         return out[:limit]
 
@@ -543,54 +651,22 @@ class AkshareAdapter(DataSource):
             r["end_date"] = str(r.get(period_col, ""))
         return rows[:limit]
 
-    # -- 现金流量表（东财优先 → 新浪降级）------------------------------
+    # -- 现金流量表（6 源轮换 + 逐源降级）--------------------------------
     def _fetch_cashflow(self, code, periods, limit, **kw) -> list[dict]:
-        ak = self._get_ak()
-        # 0) 新浪 openapi（quotes.sina.cn）—— 最快（0.12s）且科目最齐（64 项）。
-        #    实测（2026-10）：官方 JSON 接口，非爬网页；
-        #    含 OCF/员工/Capex/V1/V5 全部 AA 所需科目（伊利数值与真值一致）。
-        #    旧实现走 AkShare 的 stock_financial_report_sina（另一个新浪路径，
-        #    字段仅 71 列），已改为本端点优先。
-        try:
-            rows = self._sina_openapi_cashflow(code, periods, limit)
-            if rows and self._cashflow_usable(rows):
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 1) 同花顺
-        try:
-            rows = self._ths_cashflow(code, periods, limit)
-            if rows and self._cashflow_usable(rows):
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 2) 东财（含 D&A / 资本开支 / 已付股息）
-        try:
-            df = ak.stock_cash_flow_sheet_by_report_em(symbol=_to_em(code))
-            if df is not None and len(df):
-                rows = self._annualize(df.to_dict("records"), AF.PERIOD_COL_EM, periods)
-                for r in rows:
-                    r["end_date"] = str(r.get(AF.PERIOD_COL_EM, ""))[:10].replace("-", "")
-                return rows[:limit]
-        except Exception:                             # noqa: BLE001
-            pass
-        # 3) 雪球（0.11s，需 token）
-        try:
-            rows = self._xueqiu_report(code, "cash_flow", periods, limit)
-            if rows and self._cashflow_usable(rows):
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 4) 智兔（0.24s，拼音字段）
-        try:
-            rows = self._zhitu_report(code, "cashflow", periods, limit)
-            if rows and self._cashflow_usable(rows):
-                return rows
-        except Exception:                             # noqa: BLE001
-            pass
-        # 5) 新浪（AkShare 旧路径）降级
-        rows = self._sina_report(code, "cashflow", "现金流量表", AF.PERIOD_COL_SINA, periods, limit)
-        return rows
+        """现金流量表：6 源轮换 + 逐源降级，每源后接 _cashflow_usable() 校验。
+
+        ⚠️ 校验必要性：某些源风控时会返回「有行但值为空」的结果，
+        若直接采用，AA 会在 OCF/Capex 缺失下静默算错。
+        """
+        order = _rotated(list(self._CASHFLOW_SRCS), self._rot_idx())
+        for name in order:
+            try:
+                rows = self._src_cashflow(name, code, periods, limit)
+                if rows and self._cashflow_usable(rows):
+                    return rows
+            except Exception:                         # noqa: BLE001
+                continue
+        return []
 
     @staticmethod
     def _sina_openapi_report(code: str, report_type: str, num: int = 8) -> list[dict]:
@@ -807,11 +883,17 @@ class AkshareAdapter(DataSource):
                 "支付给职工以及为职工支付的现金": _get(r, "employees_cash_payments"),
                 "购建固定资产、无形资产和其他长期资产所支付的现金":
                     _get(r, "pay_fixed_assets_etc_cash"),
-                "处置固定资产、无形资产和其他长期资产所收回的现金净额":
-                    _get(r, "dispose_fixed_intangible_long_term_assets_loss"),
+                # ⚠️ 同花顺（AkShare 封装）现金流量表【没有】「处置固定资产收回」
+                #    这一现金口径科目。原实现在这里填了
+                #      dispose_fixed_intangible_long_term_assets_loss
+                #    但那是【利润表的处置损失】（五粮液 2025 = -1269 万），
+                #    与「处置收到的现金」（新浪 +0.37 亿）概念完全不同，
+                #    符号也常相反 → 会污染 AA 的 V1 项。故留空。
+                #    （同花顺另有 fixed_assets_net_cash，但口径不明，不采用。）
                 "取得投资收益收到的现金": _get(r, "received_invest_income_cash"),
-                "投资活动产生的现金流量净额":
-                    _get(r, "invest_cash_inflow_total", "invest_cash_outflow_total"),
+                # 投资活动净额：同花顺有专门的 invest_cash_flow_net，
+                # 不要用 inflow_total/outflow_total 相减（会得到毛额而非净额）
+                "投资活动产生的现金流量净额": _get(r, "invest_cash_flow_net"),
                 "分配股利、利润或偿付利息所支付的现金":
                     _get(r, "pay_debt_cash"),
                 "end_date": end_date,

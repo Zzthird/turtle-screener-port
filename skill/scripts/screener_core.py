@@ -1520,11 +1520,22 @@ class TushareScreener:
 
     # ---- Tier 2: Analyze single stock ----
 
-    def _analyze_single_stock(self, row: pd.Series) -> dict[str, Any] | None:
+    def _analyze_single_stock(self, row: pd.Series,
+                              idx: int = 0) -> dict[str, Any] | None:
         """Run full Tier 2 analysis on a single stock.
+
+        idx: 股票在 Tier2 队列中的序号 —— 用于六源轮换调度
+             （同一只股票的三表会从不同源开始，防止单源压力集中）。
 
         Returns dict of all metrics, or None if vetoed.
         """
+        # 设置轮换序号（适配器通过 contextvar 读取）
+        try:
+            from datasource.adapters.akshare_adapter import AkshareAdapter
+            AkshareAdapter.set_rotation_index(idx)
+        except Exception:                             # noqa: BLE001
+            pass
+
         ts_code = row["ts_code"]
         channel = row.get("channel", "main")
         close = float(row.get("close", 0))
@@ -1765,7 +1776,7 @@ class TushareScreener:
                 print(f"  [{i+1}/{total}] {ts_code} {row.get('name', '')}...", end="")
 
             try:
-                stock_result = self._analyze_single_stock(row)
+                stock_result = self._analyze_single_stock(row, idx=i)
             except Exception as e:                   # noqa: BLE001
                 # 网络/限流导致单只失败：不计入否决，记为空结果并继续
                 stock_result = None
