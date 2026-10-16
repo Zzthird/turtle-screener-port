@@ -942,13 +942,15 @@ class TushareScreener:
                 return hit.iloc[0] if len(hit) else None
 
             aa_vals = []
+            _degraded_ar = []          # 记录缺前年 AR/预收 的年份
             for _, cf_row in annual_cf.head(aa_win).iterrows():
                 yr = str(cf_row["end_date"])[:4]
                 inc_row = _year_row(annual_inc, yr)
                 bs_row = _year_row(bs_df, yr)
+                # 上一年的资产负债表——用于算 AR/预收/应付 的【净变动】。
+                # ⚠️ 拿不到就是拿不到，【不得回退到当年】（否则净变动恒为 0，
+                #    相当于没做 §17.3 的现金收入还原）。
                 bs_prev = _year_row(bs_df, str(int(yr) - 1))
-                if bs_prev is None:
-                    bs_prev = bs_row
                 if inc_row is None or cf_row is None:
                     continue
 
@@ -969,42 +971,63 @@ class TushareScreener:
 
                 T = 0.0    # AR 净增（扣除）
                 U = 0.0    # 预收净减（扣除）
+                _ar_adj_ok = True
                 ar_now = _pick(bs_row, "accounts_receiv", "应收账款")
                 ar_prev = _pick(bs_prev, "accounts_receiv", "应收账款")
-                if ar_now is not None and ar_prev is not None:
-                    T = ar_now - ar_prev
                 cl_now = _pick(bs_row, "contract_liab", "合同负债")
                 cl_prev = _pick(bs_prev, "contract_liab", "合同负债")
+                if ar_now is not None and ar_prev is not None:
+                    T = ar_now - ar_prev
+                else:
+                    _ar_adj_ok = False
                 if cl_now is not None and cl_prev is not None:
                     U = min(cl_now - cl_prev, 0.0)       # 仅净减扣，净增不加回
+                else:
+                    _ar_adj_ok = False
+                if not _ar_adj_ok:
+                    _degraded_ar.append(yr)
                 cash_rev = S - T - abs(U)
 
                 # ---- 经营性现金支出 W（§17.4）----
+                # 注意：dataset_call 输出可能用中文列名（如「支付给职工现金」），
+                #       也可能用已回译的 Tushare 名，两种都要试。
                 W1 = _pick(inc_row, "oper_cost", "营业成本") or 0.0
                 ap_now = _pick(bs_row, "acct_payable", "应付账款")
                 ap_prev = _pick(bs_prev, "acct_payable", "应付账款")
                 if ap_now is not None and ap_prev is not None:
                     W1 += (ap_prev - ap_now)              # 应付净减 -> 多付现金
-                W2 = _pick(cf_row, "c_paid_to_for_empl", "支付给职工现金") or 0.0
-                W3 = _pick(inc_row, "income_tax", "所得税") or 0.0
-                W4 = _pick(inc_row, "fin_exp", "财务费用") or 0.0
+                W2 = _pick(cf_row, "支付给职工现金", "c_pay_to_staff", "c_paid_to_for_empl") or 0.0
+                W3 = _pick(inc_row, "所得税", "income_tax") or 0.0
+                # W4 利息：
+                # ⚠️ 不能用「分配股利偿付利息」（120 亿，含股利，严重偏大）。
+                # ⚠️ 也不能用财务费用【绝对值】——伊利财务费用为负（利息净收入），
+                #    取绝对值会凭空造出一笔利息支出。
+                # 取【财务费用净额】本身（可正可负），与营业成本同属「经营支出」项；
+                # 若为负（净利息收入），相当于减少支出，是真实口径。
+                W4 = _pick(inc_row, "财务费用", "finance_exp", "fin_exp") or 0.0
                 W = W1 + W2 + W3 + W4
 
                 # ---- 总扣除 Y ----
-                capex = abs(_pick(cf_row, "c_pay_acq_const_fiolta", "资本开支") or 0.0)
+                capex = abs(_pick(cf_row, "资本开支", "c_pay_acq_const_fiolta") or 0.0)
                 Y = capex
 
                 # ---- 非经常性流入 V1 / V5 ----
-                v1 = _pick(cf_row, "c_disp_fiolta_recp", "处置固定资产收回") or 0.0
-                v5 = _pick(cf_row, "c_recp_return_invest", "取得投资收益收到") or 0.0
+                v1 = _pick(cf_row, "处置固定资产收回", "n_recp_disp_fiolta", "c_disp_fiolta_recp") or 0.0
+                v5 = _pick(cf_row, "取得投资收益收到", "n_recp_inv_income", "c_recp_return_invest") or 0.0
 
                 # ---- 字段完整度保护 ----
-                # 免费源的利润表缺 income_tax / fin_exp（值全 None）。
-                # 若 W3=W4=0，则 W 只剩「成本+应付」，会系统性【低估支出】
-                # 而【高估 AA】。此时改用 OCF 作为支出总额的上限约束：
+                # 免费后端的关键支出字段大面积缺失（实测伊利）：
+                #   c_pay_to_staff（员工 W2）、c_pay_acq_const_fiolta（Capex）、
+                #   accounts_receiv（AR）、contract_liab（合同负债）→ 均 None
+                # 此时 W 只剩「营业成本±应付」，会【低估支出、高估 AA】。
+                # 故只要缺任一关键项，就改用 OCF 作为支出总额的【上限】约束：
                 #   AA ≈ min(真实现金收入, OCF) + V1 + V5 - Capex
-                # 其理由：OCF = 真实现金收入 - W（近似），故被 min 截住不会虚高。
-                if W3 == 0.0 and W4 == 0.0:
+                # 依据：OCF = 真实现金收入 - W（近似），用 min 截住不会虚高。
+                _miss_w2 = _pick(cf_row, "支付给职工现金", "c_pay_to_staff") is None
+                _miss_capex = _pick(cf_row, "资本开支", "c_pay_acq_const_fiolta") is None
+                _miss_ar = (ar_now is None or ar_prev is None)
+                _miss_cl = (cl_now is None or cl_prev is None)
+                if _miss_w2 or _miss_capex or _miss_ar or _miss_cl:
                     ocf = _pick(cf_row, "n_cashflow_act", "经营活动现金流")
                     if ocf is not None:
                         bal = min(cash_rev, ocf) + v1 + v5 - Y
@@ -1019,6 +1042,8 @@ class TushareScreener:
                 aa_vals.append(bal / 1e6)                 # 百万元
                 aa_detail[yr] = bal / 1e6
                 result["AA_caliber"] = caliber
+            if _degraded_ar:
+                result["AA_degraded_years"] = _degraded_ar
             if aa_vals:
                 AA = sum(aa_vals) / len(aa_vals)
 

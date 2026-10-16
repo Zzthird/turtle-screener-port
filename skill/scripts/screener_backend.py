@@ -1067,10 +1067,25 @@ class FreeScreenerBackend:
         ds = self._DS_MAP.get(api_name)
         if not ds:
             return pd.DataFrame()
-        try:
-            r = get(ds, ts_code or "000001.SZ", source="auto")
-        except Exception:                             # noqa: BLE001
-            return pd.DataFrame()
+
+        # ⚠️ datasource.get(source="auto") 是按【适配器注册顺序】降级，
+        #    并不读 router.py 的 ROUTING 优先级表（实测得出的不一致）。
+        #    而 Tier2 的 AA 需要 Capex / 员工现金 / 应收 / 合同负债 / 所得税，
+        #    zzshare 这些字段全空（Value(MISSING)），只有 akshare 有。
+        #    → 对三大报表【显式指定 akshare】，拿不到时再降级 auto。
+        _PREFER_AK = {"income": "利润表", "cashflow": "现金流量表",
+                      "balancesheet": "资产负债表"}
+        r = None
+        if api_name in _PREFER_AK:
+            try:
+                r = get(ds, ts_code or "000001.SZ", source="akshare")
+            except Exception:                         # noqa: BLE001
+                r = None
+        if r is None or not len(r):
+            try:
+                r = get(ds, ts_code or "000001.SZ", source="auto")
+            except Exception:                         # noqa: BLE001
+                return pd.DataFrame()
 
         rev = {v: k for k, v in self._FIELD_ALIAS.items()}
         cur_year = _dt.date.today().year
