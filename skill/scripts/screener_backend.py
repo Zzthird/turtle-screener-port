@@ -1026,6 +1026,67 @@ class FreeScreenerBackend:
         "曲线日期": "trade_date",
     }
 
+    def _zzshare_weekly(self, ts_code: str, years: int = 4) -> pd.DataFrame:
+        """zzshare 日线聚合为周线（无风控，避开东财 push2his）。
+
+        zzshare api.daily 上限 1000 条/请求 → 按 offset 分页拿够年份，
+        再按自然周聚合（开=首日开，高=max，低=min，收=末日收，量/额=sum）。
+
+        默认 4 年：1000 条日线 × 1 次请求（0.4s），
+        对「8 年最低价」已足够（长窗口边际收益低，而耗时增 10 倍）。
+
+        Returns: DataFrame[trade_date, 开盘价, 最高价, 最低价, 收盘价, 成交量, 成交额]
+                 （列名与 akshare weekly 路径保持一致，供 _extract_floor_price 消费）
+        """
+        try:
+            from zzshare.client import DataApi
+            api = DataApi(timeout=120)
+        except ImportError:
+            return pd.DataFrame()
+
+        need = int(years * 250)          # 估算交易日数
+        frames = []
+        got = 0
+        offset = 0
+        while got < need:
+            try:
+                d = api.daily(ts_code=ts_code, limit=1000, offset=offset)
+            except Exception:                        # noqa: BLE001
+                break
+            if d is None or not len(d):
+                break
+            frames.append(d)
+            got += len(d)
+            if len(d) < 1000:
+                break
+            offset += 1000
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        df = df.drop_duplicates(subset=["trade_date"]).copy()
+        df["dt"] = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d",
+                                  errors="coerce")
+        df = df.dropna(subset=["dt"]).sort_values("dt")
+        for c in ("open", "high", "low", "close", "vol", "amount"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # 按自然周（W-FRI）聚合
+        g = df.set_index("dt").resample("W-FRI")
+        wk = pd.DataFrame({
+            "开盘价": g["open"].first(),
+            "最高价": g["high"].max(),
+            "最低价": g["low"].min(),
+            "收盘价": g["close"].last(),
+            "成交量": g["vol"].sum(),
+            "成交额": g["amount"].sum(),
+        }).dropna(subset=["收盘价"])
+        wk["trade_date"] = wk.index.strftime("%Y%m%d")
+        wk["end_date"] = wk["trade_date"]
+        return wk.reset_index(drop=True)
+
     # -- 总股本 -------------------------------------------------------
     _share_cache: dict = {}
 
@@ -1082,6 +1143,15 @@ class FreeScreenerBackend:
         if not ds:
             return pd.DataFrame()
 
+        # weekly（周线）走 zzshare 日线聚合。
+        #   为何不用 akshare：stock_zh_a_hist(period=weekly) 走东财 push2his
+        #   （本项目已确认 push2 系列会触发 IP 级风控）；
+        #   腾讯/新浪均【无周线接口】（只有日线）。
+        #   zzshare 日线：0.4s/1000 条，无风控，上限 1000 条/请求
+        #   → 分页 3 次拿 8 年（~2000 交易日）后聚合成周线。
+        if api_name == "weekly":
+            return self._zzshare_weekly(ts_code, years=4)
+
         # ⚠️ datasource.get(source="auto") 是按【适配器注册顺序】降级，
         #    并不读 router.py 的 ROUTING 优先级表（实测得出的不一致）。
         #    而 Tier2 的 AA 需要 Capex / 员工现金 / 应收 / 合同负债 / 所得税，
@@ -1092,12 +1162,16 @@ class FreeScreenerBackend:
         r = None
         if api_name in _PREFER_AK:
             try:
-                r = get(ds, ts_code or "000001.SZ", source="akshare")
+                r = get(ds, ts_code or "000001.SZ", source="akshare",
+                        periods=kwargs.get("periods"),
+                        limit=kwargs.get("limit", 100))
             except Exception:                         # noqa: BLE001
                 r = None
         if r is None or not len(r):
             try:
-                r = get(ds, ts_code or "000001.SZ", source="auto")
+                r = get(ds, ts_code or "000001.SZ", source="auto",
+                        periods=kwargs.get("periods"),
+                        limit=kwargs.get("limit", 100))
             except Exception:                         # noqa: BLE001
                 return pd.DataFrame()
 

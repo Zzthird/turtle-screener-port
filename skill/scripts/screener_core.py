@@ -190,6 +190,9 @@ class TushareScreener:
             return pd.DataFrame()
         if api_name in ("income", "cashflow", "balancesheet", "dividend", "yc_cb"):
             return b.dataset_call(api_name, ts_code, **kwargs)
+        if api_name == "weekly":
+            # 周线：zzshare 日线聚合（避开东财 push2his），详见 _zzshare_weekly
+            return b.dataset_call("weekly", ts_code, **kwargs)
         if api_name == "trade_cal":
             return b.trade_cal(kwargs.get("start_date", ""), kwargs.get("end_date", ""))
         # 未映射的接口：返回空表（调用方应能容忍）
