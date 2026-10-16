@@ -1533,6 +1533,11 @@ class TushareScreener:
             "pe_ttm": row.get("pe_ttm"),
             "pb": row.get("pb"),
             "dv_ttm": row.get("dv_ttm"),
+            # 质量指标：由 Tier1 批量源带入（Tier2 不再逐股重判）
+            "roe_waa": row.get("roe_waa"),
+            "gross_margin": row.get("grossprofit_margin"),
+            "debt_to_assets": row.get("debt_to_assets"),
+            "pledge_ratio": row.get("pledge_ratio"),
         }
 
         # Step 1: Hard vetoes (early termination)
@@ -1542,13 +1547,11 @@ class TushareScreener:
             self._clear_stock_cache(ts_code)
             return None
 
-        # Step 2: Financial quality
-        fq_passed, fq_metrics = self._check_financial_quality(ts_code, channel)
-        result.update(fq_metrics)
-        if not fq_passed:
-            result["veto"] = "financial_quality"
-            self._clear_stock_cache(ts_code)
-            return None
+        # Step 2: 财务质量（ROE/毛利率/负债率）
+        #   已【完全前移至 Tier1】且 Tier1 三项均已生效（含负债率 —— 由
+        #   zzshare balance 自算，100% 覆盖含银行）→ Tier2 不再重判，
+        #   节省 333 只 × 逐股请求。
+        #   注：原 _check_financial_quality 保留供参考，但不再调用。
 
         # Step 2b: 框架因子2 分配能力验证（一票否决）
         #   规则：FCF 长期为负 且 融资CF 持续为正 → 伪穿透回报 → 否决

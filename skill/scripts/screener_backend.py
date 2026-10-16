@@ -754,23 +754,37 @@ class FreeScreenerBackend:
         return None, None
 
     def debt_all(self, year: int = None) -> pd.DataFrame:
-        """全市场【资产负债率】（智兔 /hicw/cznl/{年}/4，一次 5000 只）。
+        """全市场【资产负债率】—— zzshare balance 表自算。
 
-        实测 2024_4：5000 行，字段含 zcfzl=资产负债率(%)。
-        ★ 银行也有值（沪农商行 93.39），优于 zzshare（无此列）。
+        实测（2026-10）：finance_latest(table="balance") 返回 5522 行（5.6s），
+        total_assets / total_liability 均 100% 非空 → 可算覆盖率 100%。
+        ★ 银行也有值（工行 92.37%、招行 90.18%、平安 90.91%），
+          而智兔 /hicw/cznl 对银行【整条缺记录】。
+
+        校验（伊利 2026-06-30）：自算 63.56%，与东财一致。
 
         Returns: DataFrame[ts_code, debt_to_assets]
         """
         if getattr(self, "_debt_all", None) is not None:
             return self._debt_all
-        d, _y = self._hicw_fetch("cznl", year)
         out = pd.DataFrame()
-        if isinstance(d, list) and d:
-            df = pd.DataFrame(d)
-            df["ts_code"] = df["dm"].astype(str).map(self._to_ts)
-            df["debt_to_assets"] = pd.to_numeric(df.get("zcfzl"), errors="coerce")
-            out = df[["ts_code", "debt_to_assets"]].dropna(
-                subset=["debt_to_assets"]).drop_duplicates("ts_code")
+        try:
+            from zzshare.client import DataApi
+            api = DataApi()
+            bal = api.finance_latest(table="balance")
+            if bal is not None and len(bal):
+                ta = pd.to_numeric(bal.get("total_assets"), errors="coerce")
+                tl = pd.to_numeric(bal.get("total_liability"), errors="coerce")
+                tmp = pd.DataFrame()
+                tmp["ts_code"] = bal["code"].astype(str)
+                tmp["debt_to_assets"] = (tl / ta * 100).where(ta > 0)
+                out = tmp.dropna(subset=["debt_to_assets"]).drop_duplicates("ts_code")
+                if self.verbose:
+                    print(f"[free-backend] 负债率来源: zzshare balance ({len(out)} 只)")
+        except Exception as e:                        # noqa: BLE001
+            if self.verbose:
+                print(f"[free-backend] zzshare balance 失败: {str(e)[:70]}")
+            out = pd.DataFrame()
         self._debt_all = out
         return out
 
@@ -902,9 +916,9 @@ class FreeScreenerBackend:
         gm = out["grossprofit_margin"]
         out.loc[gm.notna() & ((gm > 100) | (gm < -100)), "grossprofit_margin"] = None
 
-        # 资产负债率：zzshare 该表无此列，改由智兔 /hicw/cznl 批量补（含银行）。
+        # 资产负债率：zzshare balance 表自算（100% 覆盖，含银行）。
         try:
-            dz = self.debt_all(year)
+            dz = self.debt_all()
             if dz is not None and len(dz):
                 out["debt_to_assets"] = out["ts_code"].map(
                     dz.set_index("ts_code")["debt_to_assets"])
