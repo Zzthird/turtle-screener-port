@@ -1658,33 +1658,18 @@ class TushareScreener:
             cfg.weight_floor_premium * df["floor_premium_pctile"]
         )
 
-        # ── 框架因子4【仓位矩阵】 ──
-        #   KK = GG − II（安全边际，pct）。GG 取 R_used（优先粗算 R_coarse，
-        #   回退精算 R_refined），因为选股阶段无完整因子3。
+        # ── 框架因子4【安全边际 KK】 ──
+        #   KK = GG − II。GG 取 R_used（优先粗算 R_coarse，回退精算 R_refined）。
         #
-        #   框架原规则含三个维度：安全边际 KK × 外推可信度 × 陷阱风险。
-        #   后两维需 LLM / 多年细节（本项目无）→ 此处只按 KK 分档，
-        #   缺维度时【就低不就高】（保守），并在 position_note 标注。
+        #   ⚠️ 这里【只给 KK 数值，不给仓位结论】。
+        #   框架的仓位矩阵是三维：安全边际 KK × 外推可信度 × 陷阱风险，
+        #   而后两维依赖定性（护城河/行业/管理层/经营模式变化）。
+        #   选股器只有第一维 → 给不出可靠仓位。
+        #   仓位矩阵由下游 valuation agent 产出（见 agents/valuation.md 步骤3）。
         df["KK"] = df.apply(
             lambda r: (r.get("R_used") - r.get("II"))
             if (pd.notna(r.get("R_used")) and pd.notna(r.get("II"))) else None,
             axis=1)
-
-        def _position(kk):
-            """按安全边际 KK(pct) 给仓位档位（缺可信度/陷阱维度，保守取低）。"""
-            if kk is None or pd.isna(kk):
-                return "待定", "R 或 II 缺失"
-            if kk >= 1.5:
-                return "标准仓位", "KK>=1.5pct（可信度/陷阱未评，按低档）"
-            if kk >= 0.5:
-                return "50%", "KK 0.5~1.5pct（可信度/陷阱未评，按低档）"
-            if kk >= 0.0:
-                return "观察仓位(30%)", "KK 0~0.5pct"
-            return "不建仓", "KK<0（安全边际为负）"
-
-        _pos = df["KK"].apply(_position)
-        df["position"] = [p for p, _ in _pos]
-        df["position_note"] = [n for _, n in _pos]
 
         df = df.sort_values("composite_score", ascending=False)
         return df
