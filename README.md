@@ -26,15 +26,30 @@
 ```
 D:\Codes\TurtlePi\
 ├── README.md                  # 本文件
-├── skill/                     # pi skill 骨架（改通后装到 ~/.pi/agent/skills/）
-│   ├── scripts/               # [已拷] v2.x Python 脚本，22 文件 453 KB
+├── AGENTS.md                  # 项目初始化指南（工作目录约定 / API / 坑）
+├── skill/                     # pi skill 源（改完同步到 ~/.pi/agent/skills/turtle-analysis/）
+│   ├── SKILL.md               # 入口：流程 / 公式 / 硬约束
+│   ├── scripts/               # v2.x 脚本 + 自研采集器/选股器
+│   │   ├── data_collector.py       ★ 17 段统一采集入口
+│   │   ├── derived_metrics_local.py §17 网格预计算
+│   │   ├── quality_control.py       CM§1-5 确定性预算
+│   │   ├── cninfo_downloader.py     巨潮年报下载
+│   │   ├── pdf_parent_extractor.py  母公司报表提取（覆盖 7/7）
+│   │   ├── screener_core.py        ★ Tier1/Tier2 选股主逻辑
+│   │   ├── screener_backend.py     免费后端（快照/分红/质押/负债率）
+│   │   ├── screener_config.py      筛选阈值配置
+│   │   └── datasource/             ★ 数据层（防腐层）
+│   │       ├── schema.py           Value + 数据集定义（中文业务语义）
+│   │       ├── mapper.py           字段双向映射
+│   │       ├── api.py              get() / compare()
+│   │       └── adapters/           akshare / zzshare / tushare
 │   ├── shared/                # [已拷] 通用定性模块，28 文件 200 KB
 │   ├── strategies/            # [已拷] 龟龟 + 估值策略，15 文件 135 KB
 │   └── references/            # [已拷] v2.x README / CHANGELOG / requirements
-├── agents/                    # [待写] pi subagent 定义
-├── prompts/                   # [待写] pi 命令模板
-├── notes/                     # [待写] 移植笔记、差异记录
-└── output/                    # [待写] 分析结果
+├── agents/                    # pi subagent 定义（4 个，已装到 ~/.pi/agent/agents/）
+├── prompts/                   # pi 命令模板（3 个，已装到 ~/.pi/agent/prompts/）
+├── notes/                     # 移植笔记、实测记录（必读）
+└── output/                    # 分析结果
 ```
 
 ### 资产来源
@@ -53,57 +68,73 @@ D:\Codes\TurtlePi\
 - [x] **Step 1** 搭建目录骨架
 - [x] **Step 2** 拷贝 v2.x 资产（`scripts/` `shared/` `strategies/`）
 
-### 待执行
+### 已完成（全部 8 步）
 
-**Step 3 — 路径与环境适配**
-| 原写法 | pi / Windows 写法 |
+- [x] **Step 1–2** 目录骨架 + 拷贝 v2.x 资产
+- [x] **Step 3** 路径与环境适配（Windows / pi / venv）
+- [x] **Step 4** 外部依赖替换 —— **A 股已不依赖 Tushare token**
+- [x] **Step 5** `skill/SKILL.md`（含硬约束：有 §17 网格禁止手算、数字必须溯源）
+- [x] **Step 6** 4 个项目 agent（qualitative / quant / valuation / auditor）
+- [x] **Step 7** 3 个命令模板（`/turtle-analysis` `/business-analysis` `/valuation`）
+- [x] **Step 8** 端到端验证（600887 伊利，与原仓库结论一致）
+
+**Step 4 实际做的工作**（比预想重得多）：
+
+| 原依赖 | 实际情况 |
 |---|---|
-| `.venv/bin/python` | `.venv\Scripts\python.exe` |
-| `bash init.sh` | 手动 `python -m venv .venv` + `pip install -r requirements.txt` |
-| `Bash("mkdir -p ...")` | pi 的 powershell 工具 |
-| `/sessions/*/mnt/uploads/` | 用户直接提供路径 |
+| `TUSHARE_TOKEN` | ❌ 不是硬门槛 —— 已用 AkShare + zzshare + 智兔 + 雪球 + 巨潮 PDF 完全替代 |
+| 母公司报表（§3P/§4P） | Tushare 也无，改用巨潮年报 PDF 提取，覆盖 **7/7**（含银行、无框线报表） |
 
-**Step 4 — 外部依赖替换**
-| 原依赖 | 替换方案 |
-|---|---|
-| `snowball-report-downloader` 插件 | `scripts/download_report.py` |
-| `Skill(...)` 调用 | pi skill 机制 |
-| `TUSHARE_TOKEN` | **硬门槛，必须配置** |
+---
 
-**Step 5 — Skill 化**
-- 写 `skill/SKILL.md`：入口 + 流程 + 硬约束
-  - 硬约束：有 §17 网格时禁止手算，只查表选行
-  - 硬约束：支撑性数字必须带 `[src: ...]` 溯源
+## 后续开发（移植之后）
 
-**Step 6 — Subagent 编排**
-| 龟龟角色 | pi agent 文件 |
-|---|---|
-| Agent B 定量 | `agents/quant.md` |
-| Agent C 估值 | `agents/valuation.md` |
-| 定性分析 | `agents/qualitative.md` |
-| clean-room 复核 | `agents/auditor.md` |
+### 数据层多源化
 
-装 subagent 扩展：
-```powershell
-Copy-Item "D:\npm\node_modules\@agegr\pi-web\node_modules\@earendil-works\pi-coding-agent\examples\extensions\subagent\*" `
-          "C:\Users\Administrator\.pi\agent\extensions\subagent\" -Recurse
+`datasource/adapters/akshare_adapter.py` 里三类报表（利润表 / 资产负债表 / 现金流量表）
+各接 **5 个源**，彼此数值一致（见下方对照）。
+
+| 源 | 三表 | 耗时 | 已知局限 |
+|---|---|---|---|
+| **新浪 openapi** | ✅ | 0.14–0.24s | — （主力源，科目最齐，含银行） |
+| **同花顺**（AkShare 封装） | ✅ | 0.08–0.26s | 财务费用需用【利息支出 − 利息收入】合成；无「处置固定资产收回」 |
+| **雪球** | ✅ | 0.11–0.19s | 需 `xq_a_token`，会过期 |
+| **智兔** | ✅ | 0.24–0.71s | 额度小（已 4-token 轮换 + 429 自动换） |
+| **新浪 AkShare**（旧路径） | ✅ | 0.4–8.8s | 慢，末位兜底 |
+| 东财 | ⚠️ | 1.3–4.1s | 现金流表在 `dataset_call` 链路下除首列外全空，**当前不在轮换池** |
+
+单源一致性验证（AA，单位百万元）：
+
+| 股票 | 新浪 | 同花顺 | 雪球 | 智兔 | 新浪Ak |
+|---|---|---|---|---|---|
+| 五粮液 000858 | 35,262 | 35,241 | 35,262 | 35,262 | 35,262 |
+| 茅台 600519 | 105,009 | 105,004 | 105,009 | 105,009 | 105,009 |
+
+### 轮换调度
+
+Tier2 逐股分析时，三表从不同源**起点轮换**（`_rotated(pool, idx)`，
+`idx` 经 `contextvars` 传递），失败自动降级。
+
+- 首次全量跑：每源承担 ~333/5 次
+- 重跑：全部命中磁盘缓存 → **0 请求**
+
+### 断点续跑
+
+Tier2 每算完一只立即写 `output/.screener_cache/tier2_progress.json`；
+中断后重跑自动跳过已完成（含被否决的）。限流时连续 N 只失败会
+保存进度并优雅退出：
+
 ```
-
-**Step 7 — 命令模板**
-- `prompts/turtle-analysis.md` → `/turtle-analysis 600887`
-- `prompts/business-analysis.md` → `/business-analysis 600887`
-- `prompts/valuation.md` → `/valuation 600887`
-
-**Step 8 — 验证**
-- 跑 600887（伊利股份）
-- 与原仓库报告逐项对照：结论 / GG / II / 安全边际 / 因子1A 六项
-- 同一标的跑两次，确认数字稳定（v2.x 特性：逐字节一致，仅时间戳不同）
+SCREENER_TIER2_RESUME=0        强制重跑
+SCREENER_TIER2_CKPT=<path>     进度文件路径
+SCREENER_MAX_CONSEC_FAIL=5     连续失败阈值
+```
 
 ---
 
 ## 不动的东西（约 90% 文件）
 
-- 全部 Python 脚本（`derived_metrics.py` / `screener_core.py` / `valuation_engine.py` 等）
+- 全部框架 Python 脚本（`derived_metrics.py` / `valuation_engine.py` 等）
 - `shared/` 与 `strategies/` 的全部 md 内容
 - 920 个测试（`tests/`，本次未拷，如需可补）
 
@@ -111,12 +142,14 @@ Copy-Item "D:\npm\node_modules\@agegr\pi-web\node_modules\@earendil-works\pi-cod
 
 ## 真实成本
 
-| 项 | 预估 |
+| 项 | 实际 |
 |---|---|
 | 拷文件 + 改路径 | ~20 分钟 |
-| 装扩展 + 写 agent | 1–2 小时 |
-| **拿 Tushare token** | **未知，需积分，可能卡几天** |
-| **调通 + 验证结果** | **几小时（真正的成本）** |
+| 装扩展 + 写 agent | ~1 小时 |
+| **拿 Tushare token** | ❌ **不需要** —— 已用免费源完全平替 |
+| **母公司报表（§3P/§4P）** | 免费源全无 → 自写巨潮 PDF 提取，覆盖 7/7 |
+| **调通 + 验证** | **最大成本**（数据源字段对齐、口径校验） |
+| **多源轮换 + 断点续跑** | 后续开发，为跑全市场选股服务 |
 
 克隆省的是"设计架构"和"写脚本"，省不掉"配环境"和"验证"。
 
@@ -125,8 +158,9 @@ Copy-Item "D:\npm\node_modules\@agegr\pi-web\node_modules\@earendil-works\pi-cod
 ## 前置条件
 
 1. **Python ≥ 3.10**（本机 conda base = 3.12.15 ✅）
-2. **TUSHARE_TOKEN**（⚠️ 未配置，硬门槛）
-3. pi subagent 扩展（⚠️ 未安装）
+2. **TUSHARE_TOKEN**：❌ **不需要**（A 股）
+3. `.env`（可选）：`ZHITU_TOKEN` / `ZHITU_TOKENS` / `XQ_TOKEN`
+4. pi subagent 扩展（✅ 已装 `pi-subagents`）
 
 ---
 
@@ -135,7 +169,8 @@ Copy-Item "D:\npm\node_modules\@agegr\pi-web\node_modules\@earendil-works\pi-cod
 - 主干仓库：https://github.com/terancejiang/Turtle_investment_framework
 - 方法论参考（不含代码，仅用于理解思路）：https://terancejiang.github.io/Stock_Analyze_Prompts/
 - 视频《龟龟策略 agent Workflow 的设计和使用》：https://www.bilibili.com/video/BV1kzwczaEef/
+- 数据源调研：`notes/data-source-research.md` / `notes/datasource-full-test.md`
 
 ---
 
-*最后更新：Step 1、2 完成*
+*最后更新：多源轮换 + 断点续跑 + 全量 Tier2 跑通（931 只 → 390 只通过）*

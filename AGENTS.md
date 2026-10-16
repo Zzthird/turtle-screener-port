@@ -162,6 +162,10 @@ D:\Codes\TurtlePi\
 | §13 风险警示 | local（确定性检测） |
 | §17 衍生指标 | local（网格预计算） |
 
+**三类报表（利润表/资产负债表/现金流量表）**在 `akshare` 适配器内部
+另有 **5 源轮换**（见「六、选股器」）：
+`新浪openapi → 同花顺 → 雪球 → 智兔 → 新浪AkShare`（东财暂排除）。
+
 ### 常用 API
 
 ```python
@@ -292,17 +296,67 @@ Owner Earnings OE = C + D − D×G   （G 从 §17.12 网格选，D = 折旧摊�
 
 ---
 
-## 六、选股器（Tier 1 全市场粗筛）
+## 六、选股器（Tier 1 → Tier 2）
 
-**用途**：从全市场约 5200 只中筛出「低估值 + 高股息」候选池，再逐只跑深度分析。
+**用途**：从全市场约 5200 只中筛出「低估值 + 高股息」候选池（Tier1），
+再逐只算真实可支配现金 AA 与穿透回报率（Tier2）。
 
-### 数据源（三源拼合，均免费）
+### Tier1 数据源（三源拼合，均免费）
 
 | 源 | 提供 | 获取方式 |
 |---|---|---|
 | **zzshare** | PE / PB / 市值 / 换手（5226 只，一次全市场） | 免 token |
-| **智兔** | 股息率（全市场，`/hitc/lsfh` 的 `pergx`） | `ZHITU_TOKEN`（项目 .env） |
-| AkShare | 名称（`stock_info_a_code_name`） | 免费 |
+| **智兔** | 股息率（全市场，`/hitc/lsfh` 的 `pergx`） | `ZHITU_TOKEN`/`ZHITU_TOKENS` |
+| AkShare | 名称（`stock_info_a_code_name`）、质押（`stock_gpzy_pledge_ratio_em`） | 免费 |
+
+> ⚠️ **智兔额度耗尽时** `payout_all()` 返回 0 只 → Tier1 的 `R_coarse` 全空
+> → 排序自动回退到「股息率 / 1÷PE / 1÷PB」三因子（不会报错，但排序依据变了）。
+> **Tier2 的 M / AA / R_refined 是逐股独立计算，不受此影响。**
+
+### Tier2 数据源（三表各 5 源轮换）
+
+| 源 | 三表 | 耗时 | 已知局限 |
+|---|---|---|---|
+| **新浪 openapi** | ✅ | 0.14–0.24s | 主力源，科目最齐（含银行） |
+| 同花顺（AkShare 封装） | ✅ | 0.08–0.26s | 财务费用需【利息支出 − 利息收入】合成；无「处置固定资产收回」 |
+| 雪球 | ✅ | 0.11–0.19s | 需 `XQ_TOKEN`，会过期 |
+| 智兔 | ✅ | 0.24–0.71s | 额度小（已 4-token 轮换 + 429 自动换） |
+| 新浪 AkShare（旧路径） | ✅ | 0.4–8.8s | 慢，末位兜底 |
+| 东财 | ⚠️ | 1.3–4.1s | 现金流表在 `dataset_call` 链路下除首列外全空，**当前不在轮换池** |
+
+**轮换调度**：`_rotated(pool, idx)` 按股票序号轮换起点，失败自动降级；
+`idx` 经 `contextvars` 传递（`AkshareAdapter.set_rotation_index`）。
+首次全量跑每源 ~333/5 次；重跑全命中磁盘缓存则 **0 请求**。
+
+**单源一致性**（AA 百万元）：
+
+| 股票 | 新浪 | 同花顺 | 雪球 | 智兔 | 新浪Ak |
+|---|---|---|---|---|---|
+| 五粮液 000858 | 35,262 | 35,241 | 35,262 | 35,262 | 35,262 |
+| 茅台 600519 | 105,009 | 105,004 | 105,009 | 105,009 | 105,009 |
+
+### AA 口径（重要）
+
+`_extract_factor2_metrics` 输出三种口径，务必检查：
+
+| 口径 | 含义 |
+|---|---|
+| **§17.5(11步)** | 完整公式 ✅ |
+| **§17.5(OCF护)** | 缺字段→用 `min(现金收入, OCF)` 截断（**系统性偏低**：五粮液 −9.8%、茅台 −26.7%） |
+| **§17.5(缺字段)** | 连 OCF 都没有 → 简式 |
+
+触发降级的字段：员工现金 / Capex / 应收账款 / 合同负债。
+
+### 断点续跑
+
+Tier2 每算完一只立即写 `output/.screener_cache/tier2_progress.json`，
+中断后重跑自动跳过（含被否决的）。限流时连续 N 只失败会自动保存并退出。
+
+```
+SCREENER_TIER2_RESUME=0        强制重跑
+SCREENER_TIER2_CKPT=<path>     进度文件路径
+SCREENER_MAX_CONSEC_FAIL=5     连续失败阈值
+```
 
 ### 使用
 
@@ -310,6 +364,7 @@ Owner Earnings OE = C + D − D×G   （G 从 §17.12 网格选，D = 折旧摊�
 $PY = "D:\Codes\TurtlePi\skill\.venv\Scripts\python.exe"
 cd D:\Codes\TurtlePi
 & $PY skill\scripts\screener_core.py --tier1-only --csv output\screen_t1.csv
+& $PY skill\scripts\screener_core.py --csv output\screen_t2.csv
 ```
 
 **常用参数**：
@@ -384,10 +439,20 @@ output/screen_t1.csv
 ### Python 依赖
 
 ```
-pandas · tushare · pdfplumber · jinja2 · yfinance · tqdm · pytest · markdown · akshare · zzshare
+pandas · tushare · pdfplumber · jinja2 · yfinance · tqdm · pytest · markdown
+akshare · zzshare · baostock · pysnowball · mootdx
 ```
 
 重装：`skill\.venv\Scripts\python.exe -m pip install -r skill\references\requirements.txt`
+
+### 环境变量（`.env`）
+
+| 变量 | 必需 | 说明 |
+|---|---|---|
+| `ZHITU_TOKEN` | 可选 | 智兔主 token（股息率/分红） |
+| `ZHITU_TOKENS` | 可选 | 逗号分隔的多个 token，自动轮换（**单 token 日额度极小**） |
+| `XQ_TOKEN` | 可选 | 雪球 `xq_a_token`（会过期） |
+| `TUSHARE_TOKEN` | **不需要** | A 股已完全平替 |
 
 ---
 
@@ -407,6 +472,14 @@ pandas · tushare · pdfplumber · jinja2 · yfinance · tqdm · pytest · markd
 | 10 | **银行报表页被误判为目录页** | 已修 |
 | 11 | **投资支付的现金含理财滚动**，不可全额扣除 | 已修（§17.5） |
 | 12 | **§17.13 与 §17.11 的 M 窗口不同**（近3年 vs 近5年） | 已知，以 §17.11 为唯一基准 |
+| 13 | **同花顺「营业总收入 / 营业收入」字面相反** | 已修（取错则 AA 偏 +3%） |
+| 14 | **同花顺无「财务费用」字段**，只有利息支出/收入两个分量 | 已修（用差值合成） |
+| 15 | **同花顺「处置固定资产收回」实际是利润表科目** | 已修（改为留空） |
+| 16 | **雪球/智兔科目名少「所」字**，与 `CASHFLOW_SINA_MAP` 对不上 | 已修（会导致 Capex 静默丢失） |
+| 17 | **智兔拼音字段难猜**（`jlr` 是净利润，归母是 `gsmgsyzzdjlr`） | 已用数值对照确认 |
+| 18 | **智兔 429 响应体不是 JSON**（`Licence证书当日请求已超限`） | 已修（4-token 轮换 + 自动换） |
+| 19 | **东财现金流在 `dataset_call` 链路下除首列外全空** | **未定位**，已移出轮换池 |
+| 20 | **磁盘缓存不含「源」**（key = `tier2_{code}_{api}`）→ 调试时旧缓存会误导 | **调试时必须先 purge** |
 
 ### 母公司报表（§3P/§4P）增强说明
 
