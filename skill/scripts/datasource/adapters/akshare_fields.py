@@ -85,6 +85,44 @@ BALANCE_MAP = {
     "递延所得税负债": "递延所得税负债",
 }
 
+# ============ 利润表：东财英文列名 ============
+# 供 field_overrides 按 dataset_name=利润表 + source=东财 启用。
+INCOME_EM_MAP = {
+    "营业总收入":     "TOTAL_OPERATE_INCOME",
+    "营业收入":       "OPERATE_INCOME",
+    "营业成本":       "OPERATE_COST",
+    "营业税金及附加": "OPERATE_TAX_ADD",
+    "销售费用":       "SALE_EXPENSE",
+    "管理费用":       "MANAGE_EXPENSE",
+    "研发费用":       "RESEARCH_EXPENSE",
+    "财务费用":       "FINANCE_EXPENSE",
+    "投资收益":       "INVEST_INCOME",
+    "经营利润":       "OPERATE_PROFIT",
+    "利润总额":       "TOTAL_PROFIT",
+    "所得税":         "INCOME_TAX",
+    "净利润":         "NETPROFIT",
+    "归母净利润":     "PARENT_NETPROFIT",
+    "扣非归母净利润": "DEDUCT_PARENT_NETPROFIT",
+}
+
+# ============ 资产负债表：东财英文列名 ============
+BALANCE_EM_MAP = {
+    "货币资金":       "MONETARYFUNDS",
+    "应收账款":       "ACCOUNTS_RECE",
+    "应收票据":       "NOTE_ACCOUNTS_RECE",
+    "应付账款":       "ACCOUNTS_PAYABLE",
+    "应付票据":       "NOTE_ACCOUNTS_PAYABLE",
+    "合同负债":       "CONTRACT_LIAB",
+    "存货":           "INVENTORY",
+    "商誉":           "GOODWILL",
+    "固定资产":       "FIXED_ASSET",
+    "总资产":         "TOTAL_ASSETS",
+    "总负债":         "TOTAL_LIABILITIES",
+    "流动资产合计":   "TOTAL_CURRENT_ASSETS",
+    "归母权益":       "TOTAL_PARENT_EQUITY",
+    "股东权益合计":   "TOTAL_EQUITY",
+}
+
 # ============ 现金流量表：东财英文列名（补充资料齐全）============
 CASHFLOW_EM_MAP = {
     "经营活动现金流":     "NETCASH_OPERATE",

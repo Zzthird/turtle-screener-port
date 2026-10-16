@@ -146,6 +146,14 @@ class AkshareAdapter(DataSource):
 
         if dataset_name == "现金流量表" and "NETCASH_OPERATE" in keys:
             return dict(AF.CASHFLOW_EM_MAP)
+        # 东财利润表 / 资产负债表：同样需按列名切换到东财专用映射，
+        # 否则英文列名（OPERATE_INCOME 等）回译不出中文业务名 →
+        # 实测茅台走东财后 revenue 全为 None → AA 算不出（years=0）。
+        if dataset_name == "利润表" and "OPERATE_INCOME" in keys:
+            return dict(AF.INCOME_EM_MAP)
+        if dataset_name == "资产负债表" and "TOTAL_ASSETS" in keys \
+                and "MONETARYFUNDS" in keys:
+            return dict(AF.BALANCE_EM_MAP)
         if dataset_name == "分红" and "派息" in keys:
             return dict(AF.DIVIDEND_MAP)
         if dataset_name == "股权质押" and "质押比例" in keys:
@@ -184,20 +192,23 @@ class AkshareAdapter(DataSource):
     # 首次全量跑：每源承担 ~333/N 次；重跑全命中缓存 → 0 请求。
     # 源池顺序 = 降级优先级（越靠前越快/越稳）。
     #
-    # ⚠️ 为何排除两个源：
-    #   1) 东财（em）—— 已作为 _src_* 实现但【未入池】：
-    #      a. 慢，2-4s/表（其他源 0.1-0.3s）
-    #      b. field_overrides 里【只有现金流量表有东财映射表】
-    #         （CASHFLOW_EM_MAP），利润表/资产负债表缺 INCOME_EM_MAP /
-    #         BALANCE_EM_MAP → 列名无法回译成中文业务名 →
-    #         实测茅台走东财后 revenue 全为 None → AA 算不出（years=0）。
-    #   2) 智兔（zhitu）—— 额度极小（当日数十次即 429），
-    #      且三表字段有缺（所得税费用/应付账款），单独跑会降级到
-    #      「§17.5(OCF护)」口径（五粮液 AA 35,262 → 31,823，偏差 9.8%）。
-    #    两者仍保留在 _src_* 中，可手动指定 source= 使用。
-    _INCOME_SRCS = ("sina_openapi", "ths_new", "xq", "sina_ak")
-    _BALANCE_SRCS = ("sina_openapi", "ths_new", "xq", "sina_ak")
-    _CASHFLOW_SRCS = ("sina_openapi", "ths_new", "xq", "sina_ak")
+    # 各源已知局限（已实测量化，供排障参考）：
+    #   新浪 openapi  0.14-0.24s  三表字段齐全（含银行），主力源
+    #   同花顺 Ak     0.08-0.26s  财务费用需合成；无「处置固定资产收回」
+    #   雪球          0.11-0.19s  token 会过期（XQ_TOKEN）
+    #   智兔          0.24-0.71s  额度小，已用 4 token 轮换 + 429 自动换
+    #   新浪 Ak       0.4-8.8s    最慢，作末位兜底
+    #
+    # ⚠️ 东财（em）暂不入池 —— 存在未定位的映射问题：
+    #    用 _src_cashflow("em",...) 直接调用、以及 get(...,source="akshare")
+    #    都能拿到正确数据（资本开支 19.67 亿 / 员工现金 82.02 亿…），
+    #    但经 dataset_call -> _cached_call 链路时，现金流量表【除第一列
+    #    （n_cashflow_act）外全部为 None】（利润表/资产负债表正常）。
+    #    现象指向 periods/limit 传递或 _annualize 的 REPORT_DATE 处理，
+    #    尚未定位。东财仍是 _src_* 的一个选项，手动指定 source= 可用。
+    _INCOME_SRCS = ("sina_openapi", "ths_new", "xq", "zhitu", "sina_ak")
+    _BALANCE_SRCS = ("sina_openapi", "ths_new", "xq", "zhitu", "sina_ak")
+    _CASHFLOW_SRCS = ("sina_openapi", "ths_new", "xq", "zhitu", "sina_ak")
 
     def _src_income(self, name, code, periods, limit):
         ak = self._get_ak()
@@ -565,6 +576,7 @@ class AkshareAdapter(DataSource):
             "投资收益": "tzsy",
             "营业利润": "yylr",
             "利润总额": "lrze",
+            "所得税费用": "sdsfy",
             "净利润": "jlr",
             "归属于母公司所有者的净利润": "gsmgsyzzdjlr",
             "营业外收入": "ywsr",
@@ -573,10 +585,15 @@ class AkshareAdapter(DataSource):
         "balance": {
             "货币资金": "hbzj",
             "应收账款": "yszk",
+            "应付票据": "yfpj",
+            "应付账款": "yfzk",
+            "预付款项": "yfkx",
             "存货": "ch",
             "资产总计": "zczj",
             "负债合计": "fzhj",
             "合同负债": "ysk",
+            "流动资产合计": "ldzchj",
+            "固定资产净额": "gdzc",
         },
         "cashflow": {
             "经营活动产生的现金流量净额": "jyhdcsdxjlxj",
@@ -603,20 +620,47 @@ class AkshareAdapter(DataSource):
         """
         import os
         import requests
-        tok = (os.environ.get("ZHITU_TOKEN") or "").strip()
-        if not tok:
+        # token 轮换：ZHITU_TOKEN（主）+ ZHITU_TOKENS（逗号分隔的多个），
+        # 去重后按 _rot_idx() 轮换 —— 单 token 日额度极小，
+        # 不轮换则跑了十几次就 429「Licence证书当日请求已超限」。
+        toks: list[str] = []
+        for k in ("ZHITU_TOKEN", "ZHITU_TOKENS"):
+            v = (os.environ.get(k) or "").strip()
+            for t in v.split(","):
+                t = t.strip()
+                if t and t not in toks:
+                    toks.append(t)
+        if not toks:
             try:
                 import config                             # type: ignore
-                tok = str(getattr(config, "ZHITU_TOKEN", "") or "").strip()
+                v = str(getattr(config, "ZHITU_TOKEN", "") or "")
+                if v.strip():
+                    toks = [v.strip()]
             except Exception:                             # noqa: BLE001
-                tok = ""
+                toks = []
+        if not toks:
+            return []
+        tok = toks[cls._rot_idx() % len(toks)]
         if not tok:
             return []
-        r = requests.get(
-            f"https://api.zhituapi.com/hs/fin/{table}/{code}",
-            params={"token": tok}, timeout=25,
-        )
-        data = r.json()
+        # 从轮换起点开始逐个 token 试；遇 429（额度耗尽）换下一个。
+        start = toks.index(tok)
+        data = None
+        for off in range(len(toks)):
+            t = toks[(start + off) % len(toks)]
+            try:
+                r = requests.get(
+                    f"https://api.zhituapi.com/hs/fin/{table}/{code}",
+                    params={"token": t}, timeout=25,
+                )
+                if r.status_code == 429:
+                    continue                              # 额度尽 → 换 token
+                d = r.json()
+            except Exception:                             # noqa: BLE001
+                continue
+            if isinstance(d, list) and d:
+                data = d
+                break
         if not isinstance(data, list) or not data:
             return []
         need = cls._ZT_MAP.get(table) or {}
