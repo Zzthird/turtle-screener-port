@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 import time
@@ -1719,29 +1720,87 @@ class TushareScreener:
 
         total = len(ranked)
         print(f"\n=== Tier 2: Deep analysis ({total} stocks) ===")
+        cfg = self.config
 
-        results = []
+        # ── 断点续跑：从已有进度文件恢复 ──
+        #   为何需要：333 只约 20 分钟，中途可能遭上游限流/网络中断。
+        #   每算完一只立即落盘 Tushare 风格 JSON，重跑时自动跳过。
+        ckpt_path = os.environ.get("SCREENER_TIER2_CKPT") or os.path.join(
+            cfg.cache_dir, "tier2_progress.json")
+        results: list[dict] = []
+        done: set[str] = set()
+        if os.environ.get("SCREENER_TIER2_RESUME", "1") != "0" \
+                and os.path.isfile(ckpt_path):
+            try:
+                with open(ckpt_path, encoding="utf-8") as f:
+                    saved = json.load(f)
+                results = saved.get("results") or []
+                done = {r.get("ts_code") for r in results if r.get("ts_code")}
+                print(f"  [续跑] 已有进度 {len(done)} 只，跳过")
+            except Exception as e:                   # noqa: BLE001
+                print(f"  [续跑] 进度文件读取失败（忽略）：{str(e)[:60]}")
+                results, done = [], set()
+
+        def _save() -> None:
+            try:
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                with open(ckpt_path, "w", encoding="utf-8") as f:
+                    json.dump({"results": results, "total": total}, f,
+                              ensure_ascii=False)
+            except Exception:                        # noqa: BLE001
+                pass
+
         vetoed = {"pledge": 0, "audit": 0, "financial_quality": 0}
+        # 限流信号：连续多次「全接口失败」则怀疑被限流，暂停
+        _consec_fail = 0
+        _MAX_CONSEC_FAIL = int(os.environ.get("SCREENER_MAX_CONSEC_FAIL", "5"))
 
         for i, (_, row) in enumerate(ranked.iterrows()):
             ts_code = row["ts_code"]
+            if ts_code in done:
+                continue
             if progress_callback:
                 progress_callback(i + 1, total, ts_code)
             else:
                 print(f"  [{i+1}/{total}] {ts_code} {row.get('name', '')}...", end="")
 
-            stock_result = self._analyze_single_stock(row)
+            try:
+                stock_result = self._analyze_single_stock(row)
+            except Exception as e:                   # noqa: BLE001
+                # 网络/限流导致单只失败：不计入否决，记为空结果并继续
+                stock_result = None
+                _consec_fail += 1
+                print(f" ERR({type(e).__name__})")
+                if _consec_fail >= _MAX_CONSEC_FAIL:
+                    _save()
+                    print(f"\n  ⚠️ 连续 {_consec_fail} 只失败，疑似上游限流/断网。"
+                          f"\n  已完成 {len(results)} 只，进度已保存到：{ckpt_path}"
+                          f"\n  稍后重跑即从断点继续（设 SCREENER_TIER2_RESUME=0 可强制重来）。")
+                    break
+                continue
 
             if stock_result is None:
                 print(" VETOED")
+                # 被否决的也要记进度，否则重跑时会重算
+                results.append({"ts_code": ts_code, "name": row.get("name", ""),
+                                "veto": "_vetoed_"})
+                _save()
             else:
+                _consec_fail = 0
                 results.append(stock_result)
                 print(" OK")
+                _save()                              # 增量落盘
 
         if not results:
             return pd.DataFrame()
 
         result_df = pd.DataFrame(results)
+        # 剔除占位的 VETOED 记录（仅用于续跑标记）
+        if "veto" in result_df.columns:
+            result_df = result_df[result_df["veto"] != "_vetoed_"].copy()
+        result_df = result_df.drop(columns=["veto"], errors="ignore")
+        if result_df.empty:
+            return pd.DataFrame()
 
         # Compute rankings
         result_df = self._compute_rankings(result_df)
