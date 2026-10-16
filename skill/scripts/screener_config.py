@@ -32,7 +32,7 @@ class ScreenerConfig:
     - Total into Tier 2: tier2_main_limit + obs_channel_limit
 
     Tier 2 hard vetoes:
-    - Pledge ratio > max_pledge_pct → reject
+    - Pledge ratio > tier1_max_pledge → reject（已前移 Tier1）
     - Non-standard audit opinion → reject
 
     Tier 2 financial quality:
@@ -81,7 +81,7 @@ class ScreenerConfig:
     # 数据源：AkShare stock_gpzy_pledge_ratio_em（全市场 2294 行，0.7s）
     # 未出现在表中的股票 = 无质押 = 放行。
     tier1_apply_pledge: bool = True
-    tier1_max_pledge: float = 70.0    # 与 Tier2 的 max_pledge_pct 一致
+    tier1_max_pledge: float = 70.0
 
     # --- Tier 2: 是否重做质量门槛 ---
     # 默认 False：ROE/毛利率/负债率 已在 Tier1 用全市场批量源筛过，
@@ -96,7 +96,8 @@ class ScreenerConfig:
     pb_weight: float = 0.3
 
     # --- Tier 2: Hard vetoes ---
-    max_pledge_pct: float = 70.0
+    # 注：质押硬否决已前移至 Tier1（tier1_apply_pledge / tier1_max_pledge）。
+    # Tier2 只剩【审计意见非标】一项（免费源无法批量拿审计意见）。
 
     # --- Tier 2: Financial quality ---
     min_roe: float = 8.0             # %

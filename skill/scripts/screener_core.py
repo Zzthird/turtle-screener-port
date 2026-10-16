@@ -68,7 +68,6 @@ _TIER2_FIELDS = {
                        "debt_to_assets,profit_dedt,"
                        "ebitda,fcff,netdebt,interestdebt"),
     "fina_audit": "ts_code,end_date,audit_result",
-    "pledge_stat": "ts_code,end_date,pledge_count,pledge_ratio",
     "weekly": "ts_code,trade_date,close",
     "yc_cb": "trade_date,yield",
 }
@@ -81,7 +80,6 @@ _TIER2_TTL_CATEGORY = {
     "dividend": "financial",
     "fina_indicator": "financial",
     "fina_audit": "financial",
-    "pledge_stat": "financial",
     "weekly": "market",
     "yc_cb": "global",
 }
@@ -574,24 +572,14 @@ class TushareScreener:
     # ---- Tier 2: Hard vetoes ----
 
     def _check_hard_vetoes(self, ts_code: str) -> tuple[bool, str]:
-        """Check pledge ratio and audit opinion.
+        """Check audit opinion.
 
         Returns (passed, reason). If passed=False, reason explains why.
+
+        注：质押检查已【移至 Tier1】（见 _tier1_filter 第 6d 步）。
+        Tier1 用 AkShare 全市场批量一次拿完，Tier2 再逐股查属纯冗余
+        （且 run() 必经 Tier1，不存在跳过 Tier1 的单股入口）。
         """
-        cfg = self.config
-
-        # Check pledge ratio
-        try:
-            pledge_df = self._cached_call("pledge_stat", ts_code=ts_code)
-            if not pledge_df.empty:
-                pledge_df = pledge_df.sort_values("end_date", ascending=False)
-                ratio = pledge_df.iloc[0].get("pledge_ratio")
-                if ratio is not None and not (ratio != ratio):  # NaN check
-                    if float(ratio) > cfg.max_pledge_pct:
-                        return False, f"pledge_ratio={ratio:.1f}% > {cfg.max_pledge_pct}%"
-        except Exception:
-            pass  # non-fatal: data may not be available
-
         # Check audit opinion
         try:
             audit_df = self._cached_call("fina_audit", ts_code=ts_code)
