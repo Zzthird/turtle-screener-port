@@ -615,10 +615,14 @@ class AkshareAdapter(DataSource):
         sym = _strip_prefix(code)
         url = ("https://quotes.sina.cn/cn/api/openapi.php/"
                "CompanyFinanceService.getFinanceReport2022")
+        # type 参数是【季度选择器】，不是「按年度/按报告期」：
+        #   0=全部（混季报） 1=一季报 2=中报 3=三季报 4=年报
+        # 本函数只服务年报口径，故固定 type=4 ——
+        # 可直接用 num 拿 N 期【年报】，无需多拉再筛（省 ~75% 流量）。
         r = requests.get(
             url,
             params={"paperCode": f"{prefix}{sym}", "source": report_type,
-                    "type": "0", "page": "1", "num": str(num)},
+                    "type": "4", "page": "1", "num": str(num)},
             headers={"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                                     "Chrome/131.0.0.0 Safari/537.36")},
