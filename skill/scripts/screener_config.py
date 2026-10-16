@@ -62,6 +62,12 @@ class ScreenerConfig:
 
     # --- Tier 1: Ranking & cutoff ---
     tier2_main_limit: int = 150
+    # 是否在 Tier1 末尾按 R 分【截断】到 tier2_main_limit。
+    # False（默认）= 所有通过硬门槛的股票全部进 Tier2（只排序，不截断）。
+    #   理由：粗算 R 已含否决门，再截断会丢掉 R 达标但排名靠后的标的；
+    #         且 Tier2 现在已去掉重复门槛，单只成本比原先低。
+    # True = 恢复旧行为（只取 Top tier2_main_limit 进 Tier2）。
+    tier1_truncate: bool = False
     # 把 Tier2 的质量硬门槛前移到 Tier1（ROE/毛利率/负债率）。
     # 依据：这三项均可用全市场批量源一次拿到（zzshare finance_indicator，
     # ~0.8s 覆盖 5184 只），提前过滤可避免低质量股占用 Tier2 名额。
@@ -98,6 +104,15 @@ class ScreenerConfig:
     # --- Tier 2: Hard vetoes ---
     # 注：质押硬否决已前移至 Tier1（tier1_apply_pledge / tier1_max_pledge）。
     # Tier2 只剩【审计意见非标】一项（免费源无法批量拿审计意见）。
+    #
+    # 框架因子2【分配能力验证】一票否决：
+    #   FCF 长期为负 且 融资CF 持续为正 → 伪穿透回报 → 否决
+    tier2_apply_alloc_veto: bool = True
+    # --- Tier 2: 支付率锚定窗口 ---
+    # 框架原文（因子2 步骤5）：「过去 3~5 年支付率序列」。
+    # 默认 5 —— 与 datapack 的 §17.10 口径一致，便于交叉验证。
+    # 上游 screener_core 原本用 3。
+    tier2_M_years: int = 5
 
     # --- Tier 2: Financial quality ---
     min_roe: float = 8.0             # %

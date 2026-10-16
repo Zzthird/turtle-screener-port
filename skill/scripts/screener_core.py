@@ -523,7 +523,8 @@ class TushareScreener:
                     and main["R_coarse"].notna().any():
                 main["tier1_score"] = main["R_coarse"].fillna(-999)
                 main = main.sort_values("tier1_score", ascending=False)
-                main = main.head(cfg.tier2_main_limit)
+                if cfg.tier1_truncate:
+                    main = main.head(cfg.tier2_main_limit)
                 obs["tier1_score"] = 0.0
                 return pd.concat([main, obs], ignore_index=True)
 
@@ -558,7 +559,8 @@ class TushareScreener:
                 cfg.pb_weight * main["_pb_norm"]
             )
             main = main.sort_values("tier1_score", ascending=False)
-            main = main.head(cfg.tier2_main_limit)
+            if cfg.tier1_truncate:
+                main = main.head(cfg.tier2_main_limit)
             main = main.drop(columns=["_dv_norm", "_pe_norm", "_pb_norm"])
         else:
             main["tier1_score"] = []
@@ -592,6 +594,99 @@ class TushareScreener:
             pass
 
         return True, ""
+
+    def _check_allocation_capacity(self, ts_code: str) -> tuple[bool, dict[str, Any]]:
+        """框架因子2【分配能力验证】—— 一票否决项。
+
+        框架原文：
+          逐年列出过去 3-5 年的 经营CF / 投资CF / 自由现金流 / 融资CF / 期末现金，
+          判断：
+            ① 自由现金流过去 3-5 年是否持续为正？
+            ② 融资 CF 是否持续为正（持续借债）？
+            ③ 派息后现金储备是否仍在净增长？
+          否决规则：
+            「若自由现金流长期为负 且 融资活动持续为正
+              → 判定为伪穿透回报 → 一票否决」
+
+        实现口径（保守，避免误杀）：
+          - 窗口：可得的年报，最多 5 年
+          - FCF = 经营活动现金流 - |资本开支|
+          - 「长期为负」：窗口内【半数以上】年份 FCF < 0
+          - 「持续为正」：窗口内【半数以上】年份融资 CF > 0
+          - 两者同时成立 → 否决
+
+        Returns (passed, metrics)。数据不足时【放行】（不误杀）。
+        """
+        metrics: dict[str, Any] = {}
+        try:
+            cf_df = self._cached_call("cashflow", ts_code=ts_code)
+        except Exception:                              # noqa: BLE001
+            return True, metrics
+        if cf_df is None or cf_df.empty:
+            return True, metrics
+
+        cf_df = cf_df.sort_values("end_date", ascending=False)
+        annual = cf_df[cf_df["end_date"].astype(str).str.endswith("1231")]
+        # 只取已完成的年度
+        try:
+            import datetime as _dtc
+            cur_year = _dtc.date.today().year
+            annual = annual[annual["end_date"].astype(str).str[:4].astype(int) < cur_year]
+        except Exception:                              # noqa: BLE001
+            pass
+        if annual.empty or len(annual) < 3:
+            # 数据不足 3 年 —— 不做判断（避免误杀）
+            metrics["alloc_years"] = len(annual)
+            return True, metrics
+
+        rows = annual.head(5)
+        fcf_neg = 0
+        fin_pos = 0
+        n = 0
+        detail = []
+        for _, r in rows.iterrows():
+            ocf = _sf(r.get("n_cashflow_act"))
+            if ocf is None:
+                ocf = _sf(r.get("经营活动现金流"))
+            capex_raw = _sf(r.get("c_pay_acq_const_fiolta"))
+            if capex_raw is None:
+                capex_raw = _sf(r.get("资本开支"))
+            fin = _sf(r.get("n_finance_cash_flow"))
+            if fin is None:
+                fin = _sf(r.get("融资活动现金流"))
+            if ocf is None:
+                continue
+            capex = abs(capex_raw or 0.0)
+            fcf = ocf - capex
+            n += 1
+            if fcf < 0:
+                fcf_neg += 1
+            if fin is not None and fin > 0:
+                fin_pos += 1
+            detail.append({
+                "year": str(r["end_date"])[:4],
+                "fcf": round(fcf / 1e6, 0),
+                "fin_cf": round((fin or 0.0) / 1e6, 0),
+            })
+
+        if n < 3:
+            metrics["alloc_years"] = n
+            return True, metrics
+
+        half = n / 2.0
+        fcf_persist_neg = fcf_neg > half        # 半数以上年份 FCF < 0
+        fin_persist_pos = fin_pos > half        # 半数以上年份融资 CF > 0
+
+        metrics["alloc_years"] = n
+        metrics["alloc_fcf_neg_years"] = fcf_neg
+        metrics["alloc_fin_pos_years"] = fin_pos
+        metrics["alloc_fcf_persist_neg"] = fcf_persist_neg
+        metrics["alloc_fin_persist_pos"] = fin_persist_pos
+        metrics["alloc_detail"] = detail
+
+        if fcf_persist_neg and fin_persist_pos:
+            return False, metrics
+        return True, metrics
 
     # ---- Tier 2: Financial quality ----
 
@@ -812,6 +907,7 @@ class TushareScreener:
             Dict with keys: AA, M, R, II, Rf, R_vs_II (pass/marginal/fail/below_rf).
         """
         result: dict[str, Any] = {}
+        cfg = self.config
         mkt_cap = total_mv_wan * 10000 / 1e6  # 百万元
 
         # Get risk-free rate (cached globally)
@@ -856,20 +952,29 @@ class TushareScreener:
         payout_ratios = []
         if not div_df.empty and not annual_inc.empty:
             div_df = div_df.sort_values("end_date", ascending=False)
-            div_lookup = {}
+            # ⚠️ 同一年【可能有多条分红记录】（中期+年度、或特别分红），
+            #    必须【累加】而不能只取最后一条（实测伊利 2025 有 0.9 + 0.48）。
+            #    同时过滤：只计【已实施】的分红（div_proc），避免把预案/取消也算进去。
+            div_lookup: dict[str, float] = {}
             for _, r in div_df.iterrows():
                 y = str(r.get("end_date", ""))[:4]
+                if not y:
+                    continue
+                proc = str(r.get("div_proc", "") or "")
+                if proc and ("实施" not in proc and "预案" not in proc):
+                    continue          # 跳过「取消/股东大会否决」等
                 cash_div = r.get("cash_div_tax")
                 base_share = r.get("base_share")
                 if (cash_div is not None and pd.notna(cash_div)
                         and base_share is not None and pd.notna(base_share)):
                     try:
                         div_total = float(cash_div) * float(base_share) * 10000 / 1e6  # 百万元
-                        div_lookup[y] = div_total
+                        div_lookup[y] = div_lookup.get(y, 0.0) + div_total   # 累加
                     except (ValueError, TypeError):
                         pass
 
-            years = [str(r["end_date"])[:4] for _, r in annual_inc.head(3).iterrows()]
+            _mwin0 = int(getattr(cfg, "tier2_M_years", 5) or 5)
+            years = [str(r["end_date"])[:4] for _, r in annual_inc.head(_mwin0).iterrows()]
             for y in years:
                 div_total = div_lookup.get(y)
                 for _, r in annual_inc.iterrows():
@@ -884,11 +989,72 @@ class TushareScreener:
                                 pass
                         break
 
-        if payout_ratios:
-            M = sum(payout_ratios) / len(payout_ratios)
-            result["M"] = M
-        else:
-            result["M"] = None
+        # 支付率锚定值 M（框架因子2 步骤5）
+        #   框架原文：支付率锚定值 = max(近N年支付率均值, 最新派息信号推算值)
+        #   N 由 tier2_M_years 控制（默认 5，与 §17.10 一致）。
+        #   （取历史均值与最新信号推算值中的【较高者】）
+        #   旧实现只用 3 年均值 → 当公司最近大幅提高分红时会被低估。
+        M_avg = None
+        M_latest = None
+        # 帧口：tier2_M_years 年
+        _mwin = int(getattr(cfg, "tier2_M_years", 5) or 5)
+        _pr = payout_ratios[:_mwin]
+        if _pr:
+            M_avg = sum(_pr) / len(_pr)
+
+        # 最新派息信号推算值：最新一期 DPS / 最新一期 EPS（同为最新报告期）
+        try:
+            if not div_df.empty:
+                _d = div_df.sort_values("end_date", ascending=False)
+                # 最新一期：同一年可能多条 -> 累加 DPS
+                _latest_year = str(_d.iloc[0].get("end_date", ""))[:4]
+                _dps = 0.0
+                _has_dps = False
+                for _, r in _d.iterrows():
+                    if str(r.get("end_date", ""))[:4] != _latest_year:
+                        continue
+                    proc = str(r.get("div_proc", "") or "")
+                    if proc and ("实施" not in proc and "预案" not in proc):
+                        continue
+                    v = r.get("cash_div_tax")
+                    if v is not None and pd.notna(v):
+                        _dps += float(v)
+                        _has_dps = True
+                if not _has_dps:
+                    _dps = None
+                _eps = None
+                if not income_df.empty:
+                    for _, r in income_df.iterrows():
+                        v = r.get("basic_eps")
+                        if v is not None and pd.notna(v):
+                            _eps = float(v)
+                            break
+                # EPS 缺失时用「最新归母净利 / 总股本」推算
+                if (_eps is None or _eps <= 0) and not income_df.empty:
+                    _np = None
+                    for _, r in income_df.iterrows():
+                        v = r.get("n_income_attr_p")
+                        if v is not None and pd.notna(v):
+                            _np = float(v)
+                            break
+                    _sh = None
+                    for _, r in div_df.iterrows():
+                        v = r.get("base_share")
+                        if v is not None and pd.notna(v):
+                            _sh = float(v)
+                            break
+                    if _np and _sh:
+                        _eps = _np / (_sh * 10000)   # base_share 单位万股
+                if _dps is not None and _eps and _eps > 0:
+                    M_latest = _dps / _eps * 100
+        except Exception:                              # noqa: BLE001
+            M_latest = None
+
+        # 锚定：取较高者；任一缺失则用另一个
+        _cands = [v for v in (M_avg, M_latest) if v is not None]
+        result["M"] = max(_cands) if _cands else None
+        result["M_avg3"] = M_avg
+        result["M_latest"] = M_latest
 
         # AA = 真实可支配现金结余（对齐 §17.5 完整 11 步口径）
         #
@@ -1384,6 +1550,20 @@ class TushareScreener:
             self._clear_stock_cache(ts_code)
             return None
 
+        # Step 2b: 框架因子2 分配能力验证（一票否决）
+        #   规则：FCF 长期为负 且 融资CF 持续为正 → 伪穿透回报 → 否决
+        if self.config.tier2_apply_alloc_veto:
+            alloc_ok, alloc_m = self._check_allocation_capacity(ts_code)
+            result.update(alloc_m)
+            if not alloc_ok:
+                result["veto"] = ("allocation_capacity"
+                                  f"(FCF负{alloc_m.get('alloc_fcf_neg_years')}/"
+                                  f"{alloc_m.get('alloc_years')}年 + "
+                                  f"融资正{alloc_m.get('alloc_fin_pos_years')}/"
+                                  f"{alloc_m.get('alloc_years')}年)")
+                self._clear_stock_cache(ts_code)
+                return None
+
         # Step 3: Factor 2 (penetration return)
         f2 = self._extract_factor2_metrics(ts_code, total_mv_wan)
         result["M"] = f2.get("M")
@@ -1478,6 +1658,34 @@ class TushareScreener:
             cfg.weight_floor_premium * df["floor_premium_pctile"]
         )
 
+        # ── 框架因子4【仓位矩阵】 ──
+        #   KK = GG − II（安全边际，pct）。GG 取 R_used（优先粗算 R_coarse，
+        #   回退精算 R_refined），因为选股阶段无完整因子3。
+        #
+        #   框架原规则含三个维度：安全边际 KK × 外推可信度 × 陷阱风险。
+        #   后两维需 LLM / 多年细节（本项目无）→ 此处只按 KK 分档，
+        #   缺维度时【就低不就高】（保守），并在 position_note 标注。
+        df["KK"] = df.apply(
+            lambda r: (r.get("R_used") - r.get("II"))
+            if (pd.notna(r.get("R_used")) and pd.notna(r.get("II"))) else None,
+            axis=1)
+
+        def _position(kk):
+            """按安全边际 KK(pct) 给仓位档位（缺可信度/陷阱维度，保守取低）。"""
+            if kk is None or pd.isna(kk):
+                return "待定", "R 或 II 缺失"
+            if kk >= 1.5:
+                return "标准仓位", "KK>=1.5pct（可信度/陷阱未评，按低档）"
+            if kk >= 0.5:
+                return "50%", "KK 0.5~1.5pct（可信度/陷阱未评，按低档）"
+            if kk >= 0.0:
+                return "观察仓位(30%)", "KK 0~0.5pct"
+            return "不建仓", "KK<0（安全边际为负）"
+
+        _pos = df["KK"].apply(_position)
+        df["position"] = [p for p, _ in _pos]
+        df["position_note"] = [n for _, n in _pos]
+
         df = df.sort_values("composite_score", ascending=False)
         return df
 
@@ -1564,6 +1772,7 @@ class TushareScreener:
             "ts_code", "name", "industry", "close", "pe_ttm", "pb", "dv_ttm",
             "roe_waa", "gross_margin", "fcf_yield", "fcf_margin",
             "R_coarse", "R_refined", "R_divergence", "payout_ratio",
+            "alloc_years", "alloc_fcf_neg_years", "alloc_fin_pos_years",
             "ev_ebitda", "floor_premium", "composite_score"
         ] if c in df.columns]
 
