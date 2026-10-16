@@ -184,7 +184,20 @@ class AkshareAdapter(DataSource):
         返回：按报告期【升序】的记录列表，每条含「报表日期」及科目中文名。
         """
         import requests
-        prefix = "sh" if str(code)[:1] in ("6", "9") else "sz"
+        # 交易所前缀：优先用 ts_code 的后缀（.SH/.SZ/.BJ），最可靠；
+        # 无后缀时回退数字前缀（见 a-stock-data #46：51x/588x/900x 也是沪市，
+        # 仅用 code[0] in "69" 会漏判）。
+        _c = str(code).upper()
+        if _c.endswith(".SH"):
+            prefix = "sh"
+        elif _c.endswith(".SZ"):
+            prefix = "sz"
+        elif _c.endswith(".BJ"):
+            prefix = "bj"
+        else:
+            _d = "".join(ch for ch in _c if ch.isdigit()).zfill(6)
+            prefix = "sh" if _d[:3] in ("900",) or _d[0] in "69" \
+                or _d.startswith(("5", "51", "58")) else "sz"
         sym = _strip_prefix(code)
         url = ("https://quotes.sina.cn/cn/api/openapi.php/"
                "CompanyFinanceService.getFinanceReport2022")
