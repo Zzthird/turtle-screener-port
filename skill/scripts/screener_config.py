@@ -95,8 +95,16 @@ class ScreenerConfig:
     # 置 True 可恢复旧行为（调试 / 对比用）。
     tier2_recheck_quality: bool = False
     # --- Tier 2: 框架粗算 R 否决门 ---
-    # 用【精算 R（AA 口径）】再确认一次；Tier1 已用粗算 R 筛过。
-    tier2_apply_R_veto: bool = False  # 默认关（Tier2 只 150 只，避免双重剔除）
+    # 用【精算 R（AA 口径）】再确认一次。
+    #
+    # 为何【开】（2026-10 修正）：
+    #   早期担心与 Tier1 的粗算 R 门槛「双重剔除」故默认关，但该理由不成立 ——
+    #   粗算 R 用归母净利 C，精算 R 用 AA（真实可支配现金），两者【不是同一个指标】。
+    #   框架原文本就是「因子2 粗算 → 因子3 精算」两道结构。
+    #   实测（Tier2 前 20 只）有 3 只粗算达标但精算为负：
+    #     好想你 6.41/-0.55、天地科技 6.04/-0.66、宁波高发 6.23/-2.15
+    #   —— 正是「净利好看但真实现金为负」的伪穿透回报，不应放行。
+    tier2_apply_R_veto: bool = True
     dv_weight: float = 0.4
     pe_weight: float = 0.3
     pb_weight: float = 0.3
