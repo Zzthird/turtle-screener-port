@@ -945,13 +945,41 @@ class AkshareAdapter(DataSource):
         out.sort(key=lambda x: x["end_date"], reverse=True)
         return out[:limit]
 
-    # -- 分红 -----------------------------------------------------------
+    # -- 分红（东财 -> 巨潮 降级）------------------------------------
     def _fetch_dividend(self, code, periods, limit, **kw) -> list[dict]:
-        ak = self._get_ak()
+        """分红明细：东财优先，失败降巨潮。
+
+        为何多源：分红是 Tier2 的 M（支付率）唯一来源，
+        而东财 5 分钟 300 次即封 —— 931 只全量跑必然触发。
+
+        两源字段对照（均为【每 10 股派 X 元】，单位一致）：
+          方案公告日   东财「公告日期」   / 巨潮「实施方案公告日期」
+          派息         东财「派息」     / 巨潮「派息比例」
+          进度         东财「进度」     / 巨潮无（非空即已实施）
+          财年         东财需推算       / 巨潮「报告时间」直给
+        实测伊利（最近 4 期）两源派息值完全一致（9.0/4.8/12.2/12.0）。
+        """
+        # 1) 东财
         try:
-            df = ak.stock_history_dividend_detail(symbol=_strip_prefix(code), indicator="分红")
-        except Exception as e:                        # noqa: BLE001
-            raise DataSourceError(f"akshare 分红失败：{str(e)[:150]}") from e
+            rows = self._em_dividend(code, limit)
+            if rows:
+                return rows[:limit]
+        except Exception:                             # noqa: BLE001
+            pass
+        # 2) 巨潮
+        try:
+            rows = self._cninfo_dividend(code, periods, limit)
+            if rows:
+                return rows[:limit]
+        except Exception:                             # noqa: BLE001
+            pass
+        return []
+
+    def _em_dividend(self, code, limit) -> list[dict]:
+        """东财分红明细（ak.stock_history_dividend_detail）。"""
+        ak = self._get_ak()
+        df = ak.stock_history_dividend_detail(symbol=_strip_prefix(code),
+                                              indicator="分红")
         if df is None or len(df) == 0:
             return []
         rows = df.to_dict("records")
@@ -967,7 +995,53 @@ class AkshareAdapter(DataSource):
             else:
                 r["__report_year__"] = ""
             r["end_date"] = r["__report_year__"]
-        return rows[:limit]
+        return rows
+
+    def _cninfo_dividend(self, code, periods, limit) -> list[dict]:
+        """巨潮分红明细（ak.stock_dividend_cninfo）。
+
+        输出列名向【东财】对齐（公告日期/派息/进度），
+        这样 dataset_call 的 DIVIDEND_MAP 无需分源处理。
+
+        ⚠️ 巨潮返回【升序】（1996 起）；东财是降序。
+        ⚠️ 巨潮无「进度」字段 —— 该表只收录已实施方案，
+           故统一填「实施」以符合下游 div_proc 过滤逻辑。
+        ⚠️ 巨潮「报告时间」形如「2025年报」/「2025半年报」；
+           只取年报（1231），半年报归到当年（与东财推算口径不同，
+           但 M 计算只用年报，影响可忽）。
+        """
+        ak = self._get_ak()
+        df = ak.stock_dividend_cninfo(symbol=_strip_prefix(code))
+        if df is None or len(df) == 0:
+            return []
+        out = []
+        for r in df.to_dict("records"):
+            ann = str(r.get("实施方案公告日期", ""))[:10]
+            rt = str(r.get("报告时间", "") or "")
+            ym = re.match(r"(\d{4})", rt)
+            if rt.endswith("年报") and ym:
+                fy = ym.group(1)
+            elif ym:
+                fy = ym.group(1)          # 半年报 -> 当年
+            else:
+                # 回退：从公告日推算（同东财口径）
+                m2 = re.match(r"(\d{4})-(\d{2})", ann)
+                fy = (str(int(m2.group(1)) - 1) if m2 and int(m2.group(2)) <= 6
+                      else (m2.group(1) if m2 else ""))
+            out.append({
+                "公告日期": ann,
+                "送股": r.get("送股比例", 0),
+                "转增": r.get("转增比例", 0),
+                "派息": r.get("派息比例"),
+                "进度": "实施",           # 该表仅收录已实施
+                "除权除息日": str(r.get("除权日", ""))[:10],
+                "股权登记日": str(r.get("股权登记日", ""))[:10],
+                "__report_year__": f"{fy}1231" if fy else "",
+                "end_date": f"{fy}1231" if fy else "",
+            })
+        # 巨潮升序 -> 统一成降序（与东财一致）
+        out.sort(key=lambda x: x["公告日期"], reverse=True)
+        return out
 
     # -- 股权质押 -------------------------------------------------------
     def _fetch_pledge_stat(self, code, periods, limit, **kw) -> list[dict]:

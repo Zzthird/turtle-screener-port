@@ -122,10 +122,49 @@ class ScreenerConfig:
     # 上游 screener_core 原本用 3。
     tier2_M_years: int = 5
 
-    # --- Tier 2: Financial quality ---
-    min_roe: float = 8.0             # %
+    # --- 质量门槛（2026-02 换源重写）------------------------------
+    # 数据源（均为全市场批量，无需逐股）：
+    #   ROE/毛利率 -> AkShare stock_yjbb_em（东财【加权】年报口径）
+    #  负债率     -> zzshare balance 自算（含银行）
+    #   速动比率   -> 智兔 /hicw/cznl（银行整条缺记录 → 豁免）
+    #
+    # 东财接口节流（重要）：
+    #   stock_yjbb_em / stock_fhps_em 均直连东财数据中心，内部【逐页翻页】
+    #   均为【真实 HTTP 请求】（非本地分页；实测 yjbb 24 页、fhps 8 页/年）。
+    #   backend 的 _em_throttle() + _em_paged() 对【调用前 + 每页】均加间隔
+    #   （默认 1s，共 ~64 页 -> ~64s）。
+    #   可用 RATE_LIMIT_EM_INTERVAL 覆盖（设 0 则不节流）。
+    #
+    # ⚠️ 【OCF 质量门槛已删除】(2026-02)：原设计为「M 高时校验
+    #   Σ5年OCF ≥ Σ5年分红」，因 zzshare 的 OCF 数据错误而移除
+    #   （实测宇通 2023：zzshare -4.60亿 vs 实际 +47.17亿，符号相反）。
+    #   详见 screener_backend.ocf_all 的 docstring。
+    #
+    #   min_roe        : 8.0。旧值 6.0 是因为当时用 zzshare 单季×4 累加，
+    #                    口径不准且存在部分相加 bug，所以故意压低。
+    #                    现改用 yjbb_em 加权年报值（实测伊利15.81/神华13.55/
+    #                    招行14.49，与人工核对值一致），门槛可以设准。
+    #   min_roe_refined: 保留字段以兼容旧消费方；Tier2 细筛已改为
+    #                    【复用 Tier1 值】，不再重算（见 tier2 的 Step 2c）。
+    min_roe: float = 8.0             # % (Tier1，源已换 stock_yjbb_em 加权口径)
+    min_roe_refined: float = 8.0     # % (Tier2 细筛，新浪年报) —— 保留兼容
+    refined_roe_apply: bool = True               # 是否启用 Tier2 细筛
     min_gross_margin: float = 15.0   # %
     max_debt_ratio: float = 70.0     # %
+    # 速动比率下限（2026-02 新增）—— Tier1 无条件硬门槛。
+    # 来源：智兔 /hicw/cznl 的 sdbl（批量 5000 只）。实测：神华2.08/宇通1.21/伊利0.62
+    # 豁免：金融股跳过（银行在 cznl 中整条缺记录，且存款即流动负债，指标不适用）
+    min_quick_ratio: float = 0.8
+
+    # --- Tier2 分红质量②：有息负债/净资产【已禁用】2026-02 ---
+    # 🚫 禁用原因：有息负债科目【全链路拿不到】。实测 600887 伊利：
+    #   balancesheet 实际返回无 st_borr / lt_borr / bond_payable；
+    #   datasource.get("资产负债表") 仅 13 字段同样无借款；
+    #   zzshare finance_balance 借款类全空；stock_zcfz_em 无此列。
+    #   故该门槛对全部股票都是 'missing'，形同虚设。
+    # ✅ 同类风险已由 Tier1 的资产负债率 ≤70%（银行 96%）覆盖。
+    tier2_apply_debt_quality: bool = False
+    max_interest_debt_to_equity: float = 50.0   # % （仅保留供将来启用）
 
     # --- Tier 2: 银行/高杠杆行业专用门槛 ---
     # 上游 notebook 的设计意图：「对于银行等高杠杆行业，max_debt_ratio=70%
@@ -138,7 +177,10 @@ class ScreenerConfig:
     min_gross_margin_bank: float = 0.0   # 银行无「营业成本」概念，毛利率不适用
 
     # --- Tier 2: Observation channel quality (relaxed vs main) ---
-    min_roe_obs: float = 0.0                # vs 8% for main channel
+    # 观察通道 = 亏损股（负 PE → 负 ROE），ROE 门槛【无法】设正下限：
+    # 原框架设 0% 会把整条通道清空（亏损股 ROE 全为负）。故默认 -999
+    # 等效禁用，只靠 毛利率/负债率 + OCF/FCF 信号把关。
+    min_roe_obs: float = -999.0             # 等效禁用（亏损股 ROE 天然为负）
     min_fcf_margin_obs: float = 0.0         # FCF/Revenue >= 0%
     min_fcf_positive_years_obs: int = 2     # FCF positive in >= 2 of 5 years
     obs_require_ocf_positive: bool = True   # Latest year OCF > 0

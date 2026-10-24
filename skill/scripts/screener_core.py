@@ -106,6 +106,12 @@ class TushareScreener:
         self.config = config or ScreenerConfig()
         self.cache = ScreenerCache(self.config.cache_dir)
         self._rf_cache: float | None = None  # global risk-free rate
+        # Tier1 算出的 M 分量缓存（Tier2 复用，避免重算与口径不一致）
+        self._tier1_M_cache: dict[str, dict] = {}
+        # 当前股票被否决的原因（_analyze_single_stock 返回 None 时供调用方读取）
+        self._last_veto: str = ""
+        # Tier2 被否决清单（含真实原因，供审计/导出）
+        self._tier2_vetoed: pd.DataFrame = pd.DataFrame()
         self._stock_data_cache: dict[str, pd.DataFrame] = {}  # per-stock in-memory cache
         # 数据后端：有 token 走 Tushare，否则用免费源（AkShare/东财）
         self._backend = None
@@ -385,10 +391,13 @@ class TushareScreener:
         df = df[(df["pb"] > 0) & (df["pb"] <= cfg.max_pb)].copy()
 
         # 6. Dual-channel PE split (before dividend filter)
-        #    Tushare returns NaN pe_ttm for loss-making stocks (not negative)
-        pe_valid = df["pe_ttm"].notna()
-        main_mask = pe_valid & (df["pe_ttm"] > 0) & (df["pe_ttm"] <= cfg.max_pe)
-        obs_mask = ~pe_valid  # NaN PE = loss-making → observation channel
+        #    亏损股（负 PE）→ 观察通道；盈利股 → main 通道。
+        #    ⚠️ 源差异：Tushare 对亏损股返回 NaN，zzshare 返回【负 pe_ratio】。
+        #       两者都必须纳入观察通道，否则 zzshare 下观察通道恒空。
+        pe = df["pe_ttm"]
+        loss_mask = pe.isna() | (pe < 0)
+        main_mask = pe.notna() & (pe > 0) & (pe <= cfg.max_pe)
+        obs_mask = loss_mask
 
         main_df = df[main_mask].copy()
         obs_df = df[obs_mask].copy()
@@ -410,67 +419,195 @@ class TushareScreener:
                 main_df["roe_waa"] = main_df["ts_code"].map(fi["roe_waa"])
                 main_df["grossprofit_margin"] = main_df["ts_code"].map(fi["grossprofit_margin"])
                 main_df["debt_to_assets"] = main_df["ts_code"].map(fi["debt_to_assets"])
+                # 速动比率（智兔 cznl；银行整条缺记录 → NaN → 豁免）
+                if "quick_ratio" in fi.columns:
+                    main_df["quick_ratio"] = main_df["ts_code"].map(fi["quick_ratio"])
+                else:
+                    main_df["quick_ratio"] = None
+                # 数据质量标记（roe 季度不全 / 离群值 / 无记录）
+                if "_roe_flag" in fi.columns:
+                    main_df["roe_flag"] = main_df["ts_code"].map(fi["_roe_flag"]).fillna("")
+                    main_df["roe_quarters"] = main_df["ts_code"].map(fi["roe_quarters"])
+                else:
+                    main_df["roe_flag"] = ""
+                    main_df["roe_quarters"] = None
                 # 注：银行在 /hicw/cznl 中整条缺记录（实测 601398/601166 均无），
                 # 此处不再逐股补值 —— 银行豁免阈值为 96%，实测负债率 91~93%
                 # 本就通过，补值拦不住任何一只（纯浪费 40 次请求）。
                 # 若报告需展示银行负债率，由 Tier2 的 /hs/fin/ratios 补齐。
 
                 before = len(main_df)
-                # ROE：均有门槛（年度值，由 4 季累加得到）
-                ok = main_df["roe_waa"].isna() | (main_df["roe_waa"] >= cfg.min_roe)
+
+                # ── ROE 门槛（2026-02 重写）───────────────────────────────
+                # 旧写法 isna() | (>= min_roe) 把 NaN 当「免检放行」，
+                # 导致「数据有问题的股反而不受门槛约束」。
+                # 新语义分三种情况显式处理：
+                #   1) 有值 且 >= min_roe      → 通过
+                #   2) 有值 但 <  min_roe      → 剔除
+                #   3) 无值（partial/outlier/无记录）→ 不剔除，但打标待核
+                #      （不误杀：A 股合法停牌/次新股确有缺季；
+                #        但不静默放行：roe_flag 会一路带到输出列）
+                # 实测 2024 年度 zzshare 覆盖 5173/5173，其中 102 只季度
+                # 不全（1 季 34 / 2 季 54 / 3 季 14），修复前这部分被
+                # 部分相加后低调误杀。
+                roe_v = pd.to_numeric(main_df["roe_waa"], errors="coerce")
+                roe_has = roe_v.notna()
+                ok = (~roe_has) | (roe_v >= cfg.min_roe)
+                n_roe_drop = int((roe_has & (roe_v < cfg.min_roe)).sum())
+                n_roe_na = int((~roe_has).sum())
                 # 毛利率：银行为 0（不适用），其余 15%
                 gm_min = main_df["_bank"].map(
                     lambda b: cfg.min_gross_margin_bank if b else cfg.min_gross_margin)
                 ok &= main_df["grossprofit_margin"].isna() | \
                       (main_df["grossprofit_margin"] >= gm_min)
-                # 负债率：批量源拿不到（zzshare 无此列），交由 Tier2 判；
-                # 若已拿到则同样过滤
+                # 负债率：批量源拿不到时（整列为空）不参与门控；
+                # 若有值则过滤。
                 debt_max = main_df["_bank"].map(
                     lambda b: cfg.max_debt_ratio_bank if b else cfg.max_debt_ratio)
                 ok &= main_df["debt_to_assets"].isna() | \
                       (main_df["debt_to_assets"] <= debt_max)
+
+                # ── 速动比率门槛（2026-02 新增）──────────────────────────
+                # 来源：智兔 /hicw/cznl 的 sdbl（批量 5000 只，一次请求）。
+                # 实测：神华 2.08 / 宇通 1.21 / 伊利 0.62。
+                # 规则：sdbl < 0.8 → 直接筛除（无条件硬门槛）。
+                # 豁免：金融股【跳过】—— 银行在 cznl 中整条缺记录（招行不在
+                #       返回的 5000 只里），且存款即流动负债，速动比率本就不适用
+                #       （与现有 min_gross_margin_bank=0 的处理一致）。
+                # 缺失（非金融但拿不到值）→ 不剔除，与 ROE 的 NaN 语义一致：
+                #       不因自身数据缺失而误杀，也不静默当成已通过。
+                qr_v = pd.to_numeric(main_df["quick_ratio"], errors="coerce")
+                _qr_checkable = (~main_df["_bank"]) & qr_v.notna()
+                _qr_bad = _qr_checkable & (qr_v < cfg.min_quick_ratio)
+                ok &= ~_qr_bad
+                n_qr_drop = int(_qr_bad.sum())
+                n_qr_na = int(((~main_df["_bank"]) & qr_v.isna()).sum())
+
                 main_df = main_df[ok].drop(columns=["_ind", "_bank"])
+
+                # 无数据股票单独提示（既不误杀也不误解为「已通过」）
+                if n_roe_na:
+                    flagged = main_df[main_df["roe_flag"] != ""]
+                    by_flag = flagged["roe_flag"].value_counts().to_dict()
+                    print(f"  [⚠️ ROE 数据待核] {n_roe_na} 只无有效年度 ROE"
+                          f"（按标记: {by_flag}）—— 未剔除，已在输出列标注 roe_flag")
+                if n_qr_drop or n_qr_na:
+                    print(f"  [速动比率] 剔除 {n_qr_drop} 只（sdbl<{cfg.min_quick_ratio}）"
+                          f" / {n_qr_na} 只无数据（非金融，未剔除——已标注）")
                 if os.environ.get("SCREENER_VERBOSE") == "1":
                     print(f"  [Tier1 质量门槛前移] {before} -> {len(main_df)} 只"
-                          f"（ROE>={cfg.min_roe}% / 毛利率>={cfg.min_gross_margin}%"
-                          f" / 负债率<={cfg.max_debt_ratio}%）")
+                          f"（ROE>={cfg.min_roe}% 剔除 {n_roe_drop} 只"
+                          f" / 毛利率>={cfg.min_gross_margin}%"
+                          f" / 负债率<={cfg.max_debt_ratio}%"
+                          f" / 速动比率>={cfg.min_quick_ratio} 剔除 {n_qr_drop} 只）")
 
-        # 6c. 【框架因子2：粗算穿透回报率 R】
-        #     R = 归母净利 C × 支付率 M / 市值   （框架「粗算 R」定义）
-        #     否决门：R < II × 0.5 （框架因子2 粗算否决门）
-        #     ★ 上游将 R 放 Tier2 是因 Tushare 需逐股拉；
-        #       本项 C/M/市值 均由智兔批量一次拿到（~1 次请求/5000 只），
-        #       故可下放到 Tier1。
-        #     同时保留支付率上限（M <= tier1_max_payout，剔除借债分红）。
-        if cfg.tier1_apply_quality and not main_df.empty:
+        # 6b2. 观察通道：灌质量字段（ROE/毛利率/负债率/速动比率）
+        #   亏损股不设 Tier1 硬门槛，字段留给 Tier2 _check_obs_quality 用。
+        #   复用 fina_indicator_all()（内存缓存，0 额外请求）。
+        if cfg.tier1_apply_quality and not obs_df.empty:
             try:
-                po = self._backend.payout_all()
+                fi = self._backend.fina_indicator_all()
             except Exception:                          # noqa: BLE001
-                po = None
-            if po is not None and len(po):
-                po_idx = po.set_index("ts_code")
-                main_df["payout_ratio"] = main_df["ts_code"].map(po_idx["payout_ratio"])
-                main_df["net_profit"] = main_df["ts_code"].map(po_idx["net_profit"])
+                fi = None
+            if fi is not None and len(fi):
+                fi = fi.drop_duplicates("ts_code").set_index("ts_code")
+                obs_df["roe_waa"] = obs_df["ts_code"].map(fi["roe_waa"])
+                obs_df["grossprofit_margin"] = obs_df["ts_code"].map(fi["grossprofit_margin"])
+                obs_df["debt_to_assets"] = obs_df["ts_code"].map(fi["debt_to_assets"])
+                if "quick_ratio" in fi.columns:
+                    obs_df["quick_ratio"] = obs_df["ts_code"].map(fi["quick_ratio"])
+                else:
+                    obs_df["quick_ratio"] = None
+                if "_roe_flag" in fi.columns:
+                    obs_df["roe_flag"] = obs_df["ts_code"].map(fi["_roe_flag"]).fillna("")
+                    obs_df["roe_quarters"] = obs_df["ts_code"].map(fi["roe_quarters"])
+                else:
+                    obs_df["roe_flag"] = ""
+                    obs_df["roe_quarters"] = None
 
-                # 粗算 R(%) = C(百万元) × M(%) / 市值(百万元)
+        # 6c. 【框架因子2：M 计算（新口径）】（2026-02 重写）
+        #
+        # 为何重写：
+        #   ① 旧 M 用智兔 yjbb 的【单年】fpfa，实测伊利 2025 漏计导致偏差
+        #      26pp（批量 49.18% vs 逐股 75.48%）
+        #   ② 单年口径 + 粗暴阈值会误杀「主动高分红」的公司（如宇通客车：
+        #      放弃增量保证高分红，累计 M 103%）
+        #
+        # 新口径（三源均为全市场批量，5 年）：
+        #   M_avg    = Σ5年分红 / Σ5年净利          （累计，天然抗噪）
+        #   M_median = median( 正利润年 分红/利润 )   （同年比值，不缩尾）
+        #   M_latest = 最新期 DPS / 最新期 EPS
+        #   前置过滤：累计净利≤0 / 正利润年<3 → 排除
+        #   M_final：最新年盈利 → max(M_avg, M_latest)
+        #            最新年亏损 → min(M_avg, M_median)
+        #   （OCF 质量门槛已删除 —— zzshare 的 OCF 数据错误，详见下方注释）
+        #
+        # 注：M 不参与 R 计算的截断（R 大本身是信号，后续筛查会继续过滤）。
+        if cfg.tier1_apply_quality and not main_df.empty:
+            M_cols = ["M_avg", "M_median", "M_latest", "M_final",
+                      "M_flag", "M_reject", "div_5y", "np_5y"]
+            # 先清理旧列（重跑幂等）
+            main_df = main_df.drop(columns=[c for c in M_cols
+                                            if c in main_df.columns],
+                                   errors="ignore")
+            try:
+                d5 = self._backend.dividend_all_5y(
+                    years=cfg.tier2_M_years)
+            except Exception:                          # noqa: BLE001
+                d5 = None
+            if d5 is not None and len(d5):
+                mm = self._compute_M_5y(main_df["ts_code"].tolist(), d5, cfg)
+                M_KEYS = ("M_avg", "M_median", "M_latest", "M_final",
+                          "M_flag", "M_reject", "div_5y", "np_5y")
+                for c in M_KEYS:
+                    main_df[c] = main_df["ts_code"].map(mm.get(c, {}))
+                # ── 缓存供 Tier2 复用（2026-02）──
+                #   Tier2 不再逐股重算 M，直接取此缓存（同口径同公式），
+                #   避免两个 M 不一致，并省下逐股分红/利润表请求。
+                #   注：M_reject 与 M_final 的 key 集合【互补】，两者并集才是全部。
+                _all_codes = set(mm.get("M_final", {})) | set(mm.get("M_reject", {}))
+                self._tier1_M_cache = {
+                    code: {c: (mm.get(c) or {}).get(code) for c in M_KEYS}
+                    for code in _all_codes
+                }
+
+                # 粗算 R(%) = 归母净利(5年均) × M(%) / 市值(百万元)
+                #   ⚠️ 净利用 5 年均值（与 M_avg 同口径），避免用单年波动值
                 mcap = main_df["total_mv"] * 10000 / 1e6      # 万元 -> 百万元
+                main_df["net_profit"] = main_df["np_5y"]
+                main_df["payout_ratio"] = main_df["M_final"]
                 main_df["R_coarse"] = (
-                    main_df["net_profit"] * (main_df["payout_ratio"] / 100)
+                    main_df["net_profit"] * (main_df["M_final"] / 100)
                     / mcap * 100).where(mcap > 0)
 
                 before = len(main_df)
-                # (a) 支付率上限
-                ok = main_df["payout_ratio"].isna() | \
-                     (main_df["payout_ratio"] <= cfg.tier1_max_payout)
+                # M 前置过滤（累计净利/正利润年）
+                ok = main_df["M_reject"].isna()
+                n_mrej = int((~ok).sum())
+
+                # ⚠️ 【OCF 质量门槛已删除】(2026-02)
+                # 原设计：M 高时校验 Σ5年OCF ≥ Σ5年分红。
+                # 删除原因：zzshare finance_cash_flow 的 net_operate_cash_flow
+                #   【数据错误】。实测宇通客车 600066：
+                #     zzshare: 2024=26.75亿  2023=-4.60亿  2021=-0.06亿
+                #     新浪  : 2024=72.11亿  2023=+47.17亿  2021=+7.16亿
+                #   2023 年【连符号都相反】，与公开财报不符。
+                # 而全市场批量源里无正确的 OCF 绝对额：
+                #   智兔 /hicw/xj 只有比率（OCF/净利），无绝对值
+                #   新浪 stock_financial_report_sina 准确但为【单股】接口
+                # 故该判据无法在 Tier1 正确执行。若将来要恢复，需先找到
+                #   批量且准确的 OCF 源，或将其移至 Tier2（逐股新浪）。
+
                 # (b) 粗算 R 否决门：R >= II×0.5（缺失值放行）
                 _ii = getattr(self, "_tier1_ii", None)
                 if _ii is not None and cfg.tier1_apply_R:
                     ok &= main_df["R_coarse"].isna() | \
                           (main_df["R_coarse"] >= _ii * cfg.tier1_R_floor_mult)
                 main_df = main_df[ok]
+
                 if os.environ.get("SCREENER_VERBOSE") == "1":
-                    _msg = (f"  [Tier1 支付率上限] {before} -> {len(main_df)} 只"
-                            f"（M<={cfg.tier1_max_payout}%")
+                    _msg = (f"  [Tier1 M 前置过滤] {before} -> {len(main_df)} 只"
+                            f"（净利/正利润年 剔除 {n_mrej} 只")
                     if _ii is not None and cfg.tier1_apply_R:
                         _msg += (f" / R>={_ii * cfg.tier1_R_floor_mult:.2f}%"
                                  f"=II×{cfg.tier1_R_floor_mult}")
@@ -508,6 +645,100 @@ class TushareScreener:
 
         result = pd.concat([main_df, obs_df], ignore_index=True)
         return result
+
+    # ---- Tier 1: M 计算（2026-02 新口径）----
+
+    def _compute_M_5y(self, codes: list, d5: pd.DataFrame,
+                      cfg: "ScreenerConfig") -> dict:
+        """批量计算 5 年口径的 M 三分量（Tier1 用，Tier2 复用）。
+
+        输入 d5（backend.dividend_all_5y 的输出）：
+          DataFrame[ts_code, year, dps, eps, div_total_mm, np_mm, payout, prog]
+
+        输出：{列名: {ts_code: 值}}，列为：
+          M_avg / M_median / M_latest / M_final / M_flag / M_reject
+          div_5y / np_5y
+
+        口径：
+          M_avg    = Σ分红 / Σ净利
+          M_median = median( 正利润年 分红/利润 )   ← 同年比值，不缩尾
+          M_latest = 最新年 分红/利润
+          前置过滤：累计净利≤0 / 正利润年<3
+          M_final：最新年盈利 → max(M_avg, M_latest)
+                   最新年亏损 → min(M_avg, M_median)
+        """
+        mwin = int(getattr(cfg, "tier2_M_years", 5) or 5)
+        cols = ("M_avg", "M_median", "M_latest", "M_final",
+                "M_flag", "M_reject", "div_5y", "np_5y")
+        out: dict = {c: {} for c in cols}
+        if d5 is None or not len(d5):
+            return out
+        sub = d5[d5["ts_code"].isin(set(codes))]
+        if not len(sub):
+            return out
+        sub = sub.sort_values(["ts_code", "year"], ascending=[True, False])
+        for code, g in sub.groupby("ts_code", sort=False):
+            g = g.head(mwin)
+            rows = []        # (year, np_mm, div_mm, payout)
+            for _, r in g.iterrows():
+                npmm = r.get("np_mm")
+                if npmm is None or (isinstance(npmm, float) and npmm != npmm):
+                    continue
+                dvmm = r.get("div_total_mm")
+                if dvmm is not None and isinstance(dvmm, float) and dvmm != dvmm:
+                    dvmm = None
+                py = r.get("payout")
+                if py is not None and isinstance(py, float) and py != py:
+                    py = None
+                rows.append((int(r["year"]), float(npmm),
+                             (float(dvmm) if dvmm is not None else None), py))
+            if not rows:
+                continue
+            cum_np = sum(t[1] for t in rows)
+            cum_dv = sum(t[2] for t in rows if t[2] is not None)
+            pos = [t for t in rows if t[1] > 0]
+            out["np_5y"][code] = cum_np
+            out["div_5y"][code] = cum_dv
+            # 前置过滤
+            if cum_np <= 0:
+                out["M_reject"][code] = "M_cum_neg"
+                continue
+            if len(pos) < 3:
+                out["M_reject"][code] = "M_few_profit_years"
+                continue
+            if cum_dv == 0:
+                M_avg = 0.0
+            else:
+                M_avg = cum_dv / cum_np * 100
+            # 中位数（正利润年，同年比值，不缩尾）
+            prs = sorted(t[3] for t in pos if t[3] is not None)
+            M_median = None
+            if prs:
+                n = len(prs)
+                M_median = (prs[n // 2] if n % 2
+                            else (prs[n // 2 - 1] + prs[n // 2]) / 2)
+            latest = rows[0]
+            latest_np = latest[1]
+            M_latest = latest[3]
+            if latest_np > 0:
+                cand = [v for v in (M_avg, M_latest) if v is not None]
+                M_final = max(cand) if cand else None
+            else:
+                cand = [v for v in (M_avg, M_median) if v is not None]
+                M_final = min(cand) if cand else None
+            flags = []
+            if M_latest is not None and M_latest > 100.0:
+                flags.append("latest_gt100")
+            if M_avg is not None and M_avg > 100.0:
+                flags.append("avg_gt100_special_div")
+            if M_final is not None and M_final > 100.0:
+                flags.append("final_gt100")
+            out["M_avg"][code] = M_avg
+            out["M_median"][code] = M_median
+            out["M_latest"][code] = M_latest
+            out["M_final"][code] = M_final
+            out["M_flag"][code] = ",".join(flags)
+        return out
 
     # ---- Tier 1: Rank & Cut ----
 
@@ -598,6 +829,34 @@ class TushareScreener:
             pass
 
         return True, ""
+
+    def _check_debt_quality(self, ts_code: str) -> dict[str, Any]:
+        """【已禁用，2026-02】原为「有息负债/净资产 ≤ 50%」质量门槛。
+
+        🚫 为何禁用：有息负债科目【全链路拿不到】。实测 600887 伊利：
+             - _cached_call("balancesheet") 实际返回列只有：
+               money_cap / 交易性金融资产 / accounts_receiv / 存货 /
+               contract_liab / acct_payable / 商誉 / 递延所得税资产 /
+               递延所得税负债 / total_assets / total_liab / 总股本 等
+               → 【st_borr / lt_borr / bond_payable 一个都没有】
+             - datasource.get("资产负债表") 仅 13 字段，同样无借款
+             - zzshare finance_balance 借款类【全空】(notna=0/5157)
+             - AkShare stock_zcfz_em 无此列
+           故该门槛对全部股票都是 'missing'，形同虚设。
+
+        ✅ 已由 Tier1 的「资产负债率 ≤ 70%」(银行 96%) 覆盖同类风险，
+           且后者数据完整（zzshare balance 100% 覆盖，含银行）。
+
+        现恒返回 not-reject，调用方不会因此剔除任何股票。
+
+        Returns:
+            {interest_debt_to_equity: None,   # 永远取不到
+             debt_quality_reject: False,
+             debt_quality_flag: "disabled"}
+        """
+        return {"interest_debt_to_equity": None,
+                "debt_quality_reject": False,
+                "debt_quality_flag": "disabled"}
 
     def _check_allocation_capacity(self, ts_code: str) -> tuple[bool, dict[str, Any]]:
         """框架因子2【分配能力验证】—— 一票否决项。
@@ -796,6 +1055,32 @@ class TushareScreener:
             if metrics["debt_to_assets"] is not None and metrics["debt_to_assets"] > max_debt:
                 return False, metrics
 
+        # ── Tier2 细筛：新浪年报口径 ROE ──────────────────────────────
+        # 注意：本函数（_check_financial_quality）在当前 Tier2 流程中已是
+        # 【死代码】—— 质量门槛已前移至 Tier1，实际细筛在
+        # TushareScreener._check_one 的 "Step 2c" 中执行（见本文件）。
+        # 此处保留仅作参考/调试（tier2_recheck_quality=True 时生效），
+        # 逻辑与主路径保持一致：无值不剔除但标注，低于门槛则剔除。
+        metrics["roe_refined"] = None
+        metrics["roe_refined_end"] = ""
+        metrics["roe_refined_flag"] = ""
+        if getattr(cfg, "refined_roe_apply", True):
+            try:
+                rf = self._backend.roe_refined(ts_code)
+            except Exception:                          # noqa: BLE001
+                rf = None
+            if rf:
+                metrics["roe_refined"] = rf.get("roe_refined")
+                metrics["roe_refined_end"] = rf.get("end_date", "")
+                metrics["roe_refined_flag"] = rf.get("refined_flag", "")
+            rv = metrics["roe_refined"]
+            if rv is None:
+                metrics["roe_refined_flag"] = \
+                    metrics["roe_refined_flag"] or "missing"
+            elif rv < cfg.min_roe_refined:
+                metrics["roe_refined_reject"] = True
+                return False, metrics
+
         return True, metrics
 
     def _check_obs_quality(self, ts_code: str, metrics: dict[str, Any],
@@ -803,14 +1088,16 @@ class TushareScreener:
         """Observation-channel quality check: FCF-based signals.
 
         Gates:
-        1. ROE >= min_roe_obs (default 0%, relaxed from 8%)
+        1. ROE >= min_roe_obs (default -999, 等效禁用：亏损股 ROE 天然为负)
         2. Gross margin >= min_gross_margin (same as main, 15%)
         3. Debt ratio <= max_debt_ratio (same as main, 70%)
         4. OCF > 0 (if obs_require_ocf_positive)
         5. FCF margin (FCF/Revenue) >= min_fcf_margin_obs (default 0%)
         6. FCF positive years >= min_fcf_positive_years_obs (default 2 of 5)
         """
-        # Gate 1: Relaxed ROE
+        # Gate 1: ROE 门槛（默认 -999 等效禁用）
+        #   观察通道 = 亏损股，ROE 天然为负，无法设正下限；此门槛仅用于
+        #   拦截极端数据异常（roe_waa 已在上游按 |ROE|>200% 置 None）。
         if metrics["roe_waa"] is not None and metrics["roe_waa"] < cfg.min_roe_obs:
             return False, metrics
 
@@ -952,111 +1239,125 @@ class TushareScreener:
         income_df = income_df.sort_values("end_date", ascending=False)
         annual_inc = income_df[income_df["end_date"].str.endswith("1231")]
 
-        # Compute 3yr avg payout ratio M
-        payout_ratios = []
-        if not div_df.empty and not annual_inc.empty:
+        # 分红数据：按年汇总（同一年多条分红记录需【累加】，
+        # 如伊利 2025 有中期 0.9 + 年度 0.48；且只计已实施/预案，
+        # 跳过「取消/股东大会否决」）。
+        div_lookup: dict[str, float] = {}
+        if not div_df.empty:
             div_df = div_df.sort_values("end_date", ascending=False)
-            # ⚠️ 同一年【可能有多条分红记录】（中期+年度、或特别分红），
-            #    必须【累加】而不能只取最后一条（实测伊利 2025 有 0.9 + 0.48）。
-            #    同时过滤：只计【已实施】的分红（div_proc），避免把预案/取消也算进去。
-            div_lookup: dict[str, float] = {}
             for _, r in div_df.iterrows():
                 y = str(r.get("end_date", ""))[:4]
                 if not y:
                     continue
                 proc = str(r.get("div_proc", "") or "")
                 if proc and ("实施" not in proc and "预案" not in proc):
-                    continue          # 跳过「取消/股东大会否决」等
+                    continue
                 cash_div = r.get("cash_div_tax")
                 base_share = r.get("base_share")
                 if (cash_div is not None and pd.notna(cash_div)
                         and base_share is not None and pd.notna(base_share)):
                     try:
-                        div_total = float(cash_div) * float(base_share) * 10000 / 1e6  # 百万元
-                        div_lookup[y] = div_lookup.get(y, 0.0) + div_total   # 累加
+                        div_total = (float(cash_div) * float(base_share)
+                                     * 10000 / 1e6)          # 百万元
+                        div_lookup[y] = div_lookup.get(y, 0.0) + div_total
                     except (ValueError, TypeError):
                         pass
 
-            _mwin0 = int(getattr(cfg, "tier2_M_years", 5) or 5)
-            years = [str(r["end_date"])[:4] for _, r in annual_inc.head(_mwin0).iterrows()]
-            for y in years:
-                div_total = div_lookup.get(y)
+        # ── 支付率锚定值 M（框架因子2 步骤5，2026-02 重写）────────────
+        #
+        # 旧实现的缺陷：
+        #   ① M_avg = 对【单年】分红/净利 取 5 年平均
+        #      → 净利塌陷年会产生 800% 之类的爆炸值，直接污染均值
+        #   ② M = max(M_avg, M_latest) 无条件取大
+        #      → 最新年亏损时 M_latest 不可信，却仍能抬高 M
+        #   ③ 无任何长期可持续性检查
+        #
+        # 新口径（分层，按【持续性】而非【单点】判定）：
+        #   前置过滤：累计净利≤0 / 正利润年<3  → 排除
+        #   M_avg    = 累计分红 / 累计净利（累计口径天然抗噪）
+        #   M_median = 正利润年缩尾后支付率的中位数
+        #   M_latest = 最新期 DPS / 最新期 EPS
+        #
+        #   分量检查（无条件，先于 M_final）：
+        #     M_avg    > 120% → 某年异常到 200%+，分母塌陷/数据异常 → 排除
+        #     M_avg    > 100% → 某年特别分红 → 保留 + 标记 avg_gt100_special_div
+        #     M_median > 100% → 过半正常年不可持续         → 排除
+        #   最终取值：
+        #     最新年盈利 → M = max(M_avg, M_latest)   允许反映「最近真的多分了」
+        #     最新年亏损 → M = min(M_avg, M_median)   最新信号不可信，双保险取小
+        #   标记（不拦截）：
+        #     M_latest > 100% → M_flag='latest_gt100'（仅 1 年，样本太小，不定罪）
+        #
+        # 原则：Tier2 是最后一道防线，宁可保守，不可乐观。
+        #
+        # ⚠️ 【2026-02 改为复用 Tier1 的 M】(不再逐股重算)
+        #   理由：Tier1 已改用 AkShare stock_fhps_em（5 年批量）算 M，
+        #         数据源与口径均已统一，无需在 Tier2 重算（避免两个 M 不一致）。
+        #   Tier1 传入在 _analyze_single 的 row 中（M_avg / M_median /
+        #   M_latest / M_final / M_flag / M_reject / div_5y）。
+        #   只有 Tier1 未传出时（如单独调试单股）才回退到逐股计算。
+        M_avg = M_median = M_latest = M_final = None
+        M_flag = ""
+        M_reject = None
+        M_diag: dict = {}
+        _mwin = int(getattr(cfg, "tier2_M_years", 5) or 5)
+        _w_lo, _w_hi = 0.0, 150.0
+        yearly: list[tuple[str, float, float | None, float | None]] = []
+        if not annual_inc.empty:
+            _years = [str(r["end_date"])[:4]
+                      for _, r in annual_inc.head(_mwin).iterrows()]
+            for y in _years:
+                _np_f = None
                 for _, r in annual_inc.iterrows():
                     if str(r["end_date"])[:4] == y:
-                        np_val = r.get("n_income_attr_p")
-                        if np_val is not None:
-                            try:
-                                np_f = float(np_val) / 1e6  # 百万元
-                                if div_total and np_f > 0:
-                                    payout_ratios.append(div_total / np_f * 100)
-                            except (ValueError, TypeError):
-                                pass
-                        break
-
-        # 支付率锚定值 M（框架因子2 步骤5）
-        #   框架原文：支付率锚定值 = max(近N年支付率均值, 最新派息信号推算值)
-        #   N 由 tier2_M_years 控制（默认 5，与 §17.10 一致）。
-        #   （取历史均值与最新信号推算值中的【较高者】）
-        #   旧实现只用 3 年均值 → 当公司最近大幅提高分红时会被低估。
-        M_avg = None
-        M_latest = None
-        # 帧口：tier2_M_years 年
-        _mwin = int(getattr(cfg, "tier2_M_years", 5) or 5)
-        _pr = payout_ratios[:_mwin]
-        if _pr:
-            M_avg = sum(_pr) / len(_pr)
-
-        # 最新派息信号推算值：最新一期 DPS / 最新一期 EPS（同为最新报告期）
-        try:
-            if not div_df.empty:
-                _d = div_df.sort_values("end_date", ascending=False)
-                # 最新一期：同一年可能多条 -> 累加 DPS
-                _latest_year = str(_d.iloc[0].get("end_date", ""))[:4]
-                _dps = 0.0
-                _has_dps = False
-                for _, r in _d.iterrows():
-                    if str(r.get("end_date", ""))[:4] != _latest_year:
-                        continue
-                    proc = str(r.get("div_proc", "") or "")
-                    if proc and ("实施" not in proc and "预案" not in proc):
-                        continue
-                    v = r.get("cash_div_tax")
-                    if v is not None and pd.notna(v):
-                        _dps += float(v)
-                        _has_dps = True
-                if not _has_dps:
-                    _dps = None
-                _eps = None
-                if not income_df.empty:
-                    for _, r in income_df.iterrows():
-                        v = r.get("basic_eps")
-                        if v is not None and pd.notna(v):
-                            _eps = float(v)
-                            break
-                # EPS 缺失时用「最新归母净利 / 总股本」推算
-                if (_eps is None or _eps <= 0) and not income_df.empty:
-                    _np = None
-                    for _, r in income_df.iterrows():
                         v = r.get("n_income_attr_p")
                         if v is not None and pd.notna(v):
-                            _np = float(v)
-                            break
-                    _sh = None
-                    for _, r in div_df.iterrows():
-                        v = r.get("base_share")
-                        if v is not None and pd.notna(v):
-                            _sh = float(v)
-                            break
-                    if _np and _sh:
-                        _eps = _np / (_sh * 10000)   # base_share 单位万股
-                if _dps is not None and _eps and _eps > 0:
-                    M_latest = _dps / _eps * 100
-        except Exception:                              # noqa: BLE001
-            M_latest = None
+                            try:
+                                _np_f = float(v) / 1e6        # 百万元
+                            except (ValueError, TypeError):
+                                _np_f = None
+                        break
+                if _np_f is None:
+                    continue
+                _dv_f = div_lookup.get(y)                     # 百万元，可能 None
+                _pr_y = None
+                if _dv_f is not None and _np_f > 0:
+                    _pr_y = _dv_f / _np_f * 100
+                yearly.append((y, _np_f, _dv_f, _pr_y))
 
-        # 锚定：取较高者；任一缺失则用另一个
-        _cands = [v for v in (M_avg, M_latest) if v is not None]
-        result["M"] = max(_cands) if _cands else None
+        # （旧逐股 M 计算已整体移除 —— 现【复用 Tier1 的 stock_fhps_em
+        #   结果】，见下方「M 取值」区块。去掉重算既避免两个 M 不一致，
+        #   也省下逐股分红/利润表请求。）
+        _ = yearly
+
+        # ⚠️ M 取值（2026-02）：优先复用 Tier1 的批量结果。
+        #   Tier1 的 stock_fhps_em 与 Tier2 原逐股路径【同口径同公式】，
+        #   复用可避免两个 M 不一致（同时省下逐股分红/利润表请求）。
+        #   M_refined 等旧列名保留以兼容已有消费方（R_refined 等）。
+        _pre = self._tier1_M_cache.get(ts_code) if hasattr(self, "_tier1_M_cache") else None
+        if _pre:
+            M_avg = _pre.get("M_avg")
+            M_median = _pre.get("M_median")
+            M_latest = _pre.get("M_latest")
+            M_final = _pre.get("M_final")
+            M_flag = _pre.get("M_flag") or ""
+            M_reject = _pre.get("M_reject")
+            M_diag = {"source": "tier1_fhps_em",
+                      "div_5y": _pre.get("div_5y"),
+                      "np_5y": _pre.get("np_5y")}
+        else:
+            # 回退：逐股计算（仅当 Tier1 未传值时，如单独调试单股）
+            M_diag["source"] = "tier2_local"
+        result["M_source"] = M_diag.get("source", "")
+        result["M"] = M_final
+        result["M_refined"] = M_final
+        result["M_refined_avg"] = M_avg
+        result["M_refined_median"] = M_median
+        result["M_refined_latest"] = M_latest
+        result["M_refined_window"] = _mwin
+        result["M_refined_flag"] = M_flag
+        result["M_refined_reject"] = M_reject
+        result["M_refined_diag"] = M_diag
         result["M_avg3"] = M_avg
         result["M_latest"] = M_latest
 
@@ -1078,6 +1379,9 @@ class TushareScreener:
             aa_win = int(os.environ.get("SCREENER_AA_YEARS", "2"))
         except ValueError:
             aa_win = 2
+        # ⚠️ 必须在 if 块【外】初始化：cf_df/annual_inc 任一为空时下面整块跳过，
+        #    但 L1209 仍会读 aa_vals（AA_years 统计），否则 UnboundLocalError。
+        aa_vals: list[float] = []
         if not cf_df.empty and not annual_inc.empty:
             cf_sorted = cf_df.sort_values("end_date", ascending=False)
             annual_cf = cf_sorted[cf_sorted["end_date"].astype(str).str.endswith("1231")]
@@ -1099,7 +1403,6 @@ class TushareScreener:
                 hit = df[df["end_date"].astype(str).str[:4] == y]
                 return hit.iloc[0] if len(hit) else None
 
-            aa_vals = []
             _degraded_ar = []          # 记录缺前年 AR/预收 的年份
             for _, cf_row in annual_cf.head(aa_win).iterrows():
                 yr = str(cf_row["end_date"])[:4]
@@ -1467,12 +1770,14 @@ class TushareScreener:
 
         # ③ 历史最低价（列名兼容：zzshare 聚合给「收盘价」，
         #    旧 akshare 路径给 close）
+        #    ⚠️ 窗口 = _zzshare_weekly 默认 4 年（非 10 年），标签须与之一致，
+        #       否则读报告的人会以为这是十年低点。
         if not weekly_df.empty:
             _ccol = "close" if "close" in weekly_df.columns else "收盘价"
             if _ccol in weekly_df.columns:
                 min_close = pd.to_numeric(weekly_df[_ccol], errors="coerce").dropna().min()
                 if min_close is not None and min_close == min_close:
-                    baselines.append(("10yr_low", float(min_close)))
+                    baselines.append(("4yr_low", float(min_close)))
 
         # ④ Dividend implied price
         rf = self._rf_cache
@@ -1529,6 +1834,8 @@ class TushareScreener:
 
         Returns dict of all metrics, or None if vetoed.
         """
+        # 记录否决原因：返回 None 时，调用方从 self._last_veto 读取。
+        self._last_veto = ""
         # 设置轮换序号（适配器通过 contextvar 读取）
         try:
             from datasource.adapters.akshare_adapter import AkshareAdapter
@@ -1563,6 +1870,7 @@ class TushareScreener:
         if not passed:
             result["veto"] = reason
             self._clear_stock_cache(ts_code)
+            self._last_veto = result.get("veto") or "unknown"
             return None
 
         # Step 2: 财务质量（ROE/毛利率/负债率）
@@ -1571,7 +1879,46 @@ class TushareScreener:
         #   节省 333 只 × 逐股请求。
         #   注：原 _check_financial_quality 保留供参考，但不再调用。
 
-        # Step 2b: 框架因子2 分配能力验证（一票否决）
+        # Step 2b: 观察通道 —— 放宽质量门槛（FCF 信号替代 ROE≥8%）
+        #   亏损股（负 PE）无法用 ROE 门槛，改用原框架的 FCF 信号：
+        #     ROE ≥ min_roe_obs(0) / 毛利率≥15% / 负债率≤70% /
+        #     最近一年 OCF>0 / FCF 率≥0% / 5 年中 ≥2 年 FCF 为正。
+        #   注：Tier1 已给观察通道灌好 roe/gross/debt 字段（见 6b2），
+        #       ROE 门槛已禁用（min_roe_obs=-999），实际生效：
+        #       毛利率≥15% / 负债率≤70% / OCF>0 / FCF率≥0% / FCF 正年≥2。
+        if channel == "observation":
+            passed, obs_m = self._check_obs_quality(ts_code, result, self.config)
+            result.update(obs_m)
+            if not passed:
+                result["veto"] = "obs_quality"
+                self._clear_stock_cache(ts_code)
+                self._last_veto = result.get("veto") or "unknown"
+                return None
+
+        # Step 2c: 【ROE 质量】（2026-02 简化：不再逐股重算）
+        #   历史演变：
+        #     v1  zzshare 单季×4 累加（口径不准 + 部分相加 bug）
+        #     v2  两级：Tier1 zzshare 累加(6%) / Tier2 新浪年报(8%)
+        #     v3  当前：ROE 【统一用 Tier1 的 stock_yjbb_em 加权年报值】
+        #   为何取消两级：Tier1 的源已换成 yjbb_em（东财加权口径，
+        #     实测伊利 15.81 / 神华 13.55 / 招行 14.49，与人工核对值一致），
+        #     数据准确度已足够，无需再用新浪逐股复核（省 5173 次请求）。
+        #   Tier2 仅【复用】Tier1 传入的 roe_waa 与 min_roe 门槛做双保险。
+        result["roe_refined"] = result.get("roe_waa")
+        result["roe_refined_end"] = ""
+        result["roe_refined_flag"] = ""
+        if channel != "observation":
+            _rv = result.get("roe_waa")
+            if _rv is None:
+                # Tier1 未传值（如单独调试单股）→ 标注待核，不剔除
+                result["roe_refined_flag"] = "missing"
+            elif _rv < self.config.min_roe:
+                result["roe_refined_reject"] = True
+                self._clear_stock_cache(ts_code)
+                self._last_veto = result.get("veto") or "unknown"
+                return None
+
+        # Step 2d: 框架因子2 分配能力验证（一票否决）
         #   规则：FCF 长期为负 且 融资CF 持续为正 → 伪穿透回报 → 否决
         if self.config.tier2_apply_alloc_veto:
             alloc_ok, alloc_m = self._check_allocation_capacity(ts_code)
@@ -1583,11 +1930,47 @@ class TushareScreener:
                                   f"融资正{alloc_m.get('alloc_fin_pos_years')}/"
                                   f"{alloc_m.get('alloc_years')}年)")
                 self._clear_stock_cache(ts_code)
+                self._last_veto = result.get("veto") or "unknown"
                 return None
+
+        # Step 2e: 【分红质量④条 —— 现状说明】（2026-02）
+        #   用户原设计的四条质量条件，最终落地情况：
+        #     ① Σ5年OCF ≥ Σ5年分红   → 【已删】zzshare OCF 数据错误
+        #                                  （实测宇通 2023：-4.60 vs +47.17亿）
+        #     ② 有息负债/净资产 ≤ 50%  → 【已删】借款科目全链路拿不到
+        #                                  （balancesheet 返回无 st_borr 等）
+        #     ③ 未分配利润 > 0         → 【已删】法定约束下几乎不触发
+        #     ④ 分红后现金 ≥ 短债      → 【已改为】Tier1 速动比率 ≥ 0.8
+        #   即：四条中仅第④条以「速动比率」形式在 Tier1 生效，
+        #       其余三条因数据不可得或逻辑无效而不适用。
+        #   替代保障：【Tier1 资产负债率 ≤ 70%】（银行 96%），
+        #       数据完整（zzshare balance 100% 覆盖，含银行）。
 
         # Step 3: Factor 2 (penetration return)
         f2 = self._extract_factor2_metrics(ts_code, total_mv_wan)
         result["M"] = f2.get("M")
+        # M_refined 为 Tier2 逐股口径（累计+中位数+分支锚定，R_refined 的推导据）；
+        # Tier1 的智兔单年值保留在 payout_ratio 列（R_coarse 的推导据）。
+        result["M_refined"] = f2.get("M_refined", f2.get("M"))
+        result["M_refined_avg"] = f2.get("M_refined_avg")
+        result["M_refined_median"] = f2.get("M_refined_median")
+        result["M_refined_latest"] = f2.get("M_refined_latest")
+        result["M_refined_flag"] = f2.get("M_refined_flag", "")
+        result["M_refined_reject"] = f2.get("M_refined_reject")
+        result["M_refined_diag"] = f2.get("M_refined_diag")
+
+        # Step 3a: 【Tier2 M 否决】（2026-02）
+        #   现在 M 完全【复用 Tier1 的 stock_fhps_em 结果】，M_reject 也是
+        #   Tier1 算好的（前置过滤：累计净利≤0 / 正利润年<3）。
+        #   注：Tier1 已在同一处用 M_reject 做过过滤，正常流程下这里不会
+        #       触发；保留此判为【双保险】，防止 Tier1→Tier2 的传递遗漏。
+        _mrej = result.get("M_refined_reject")
+        if _mrej:
+            result["veto"] = _mrej
+            self._clear_stock_cache(ts_code)
+            self._last_veto = result.get("veto") or "unknown"
+            return None
+
         result["R"] = f2.get("R")
         result["II"] = f2.get("II")
         result["Rf"] = f2.get("Rf")
@@ -1597,10 +1980,15 @@ class TushareScreener:
 
         # Step 3b: 粗算 R（框架原生，Tier1 已传）
         #   R_coarse = C × M / 市值（粗算，假设净利全可分）
+        #                C/M 均用 Tier1 智兔单年口径
         #   R        = AA × M / 市值（精算，AA=真实可支配现金）
+        #                此处 M 用 Tier2 的 M_refined（5 年均值锚定）
         #   两者差异 > 30% → 现金质量与净利背离，需人工看。
-        result["R_refined"] = f2.get("R")          # 精算（AA 口径）
-        result["R_coarse"] = row.get("R_coarse")   # 粗算（净利口径）
+        result["R_refined"] = f2.get("R")          # 精算（AA × M_refined 口径）
+        result["R_coarse"] = row.get("R_coarse")   # 粗算（净利 × Tier1 M 口径）
+        # ⚠️ 两个 payout 分开存，避免同名不同义（2026-02 修复）：
+        #   payout_ratio      = Tier1 智兔单年值（R_coarse 的推导据）
+        #   M_refined         = Tier2 逐股 5 年锚定值（R_refined 的推导据）
         result["payout_ratio"] = row.get("payout_ratio")
         result["net_profit"] = row.get("net_profit")
         _rc, _rr = result.get("R_coarse"), result.get("R_refined")
@@ -1620,6 +2008,7 @@ class TushareScreener:
                 and result["R_refined"] < _ii * _cfg.tier1_R_floor_mult):
             result["veto"] = "R_below_floor(AA口径)"
             self._clear_stock_cache(ts_code)
+            self._last_veto = result.get("veto") or "unknown"
             return None
 
         # Step 4: Factor 4 (valuation)
@@ -1791,10 +2180,14 @@ class TushareScreener:
                 continue
 
             if stock_result is None:
-                print(" VETOED")
-                # 被否决的也要记进度，否则重跑时会重算
+                # 原因从 _analyze_single 的日志/返回中取不到（它返回 None），
+                # 改为取最近一次记录的 _last_veto 原因（见 _analyze_single）。
+                _vreason = getattr(self, "_last_veto", "unknown")
+                print(f" VETOED({_vreason})")
+                # 被否决的也要记进度，否则重跑时会重算；
+                # 保留真实否决原因，便于审计（旧实现只存 '_vetoed_'）。
                 results.append({"ts_code": ts_code, "name": row.get("name", ""),
-                                "veto": "_vetoed_"})
+                                "veto": _vreason or "unknown"})
                 _save()
             else:
                 _consec_fail = 0
@@ -1806,9 +2199,11 @@ class TushareScreener:
             return pd.DataFrame()
 
         result_df = pd.DataFrame(results)
-        # 剔除占位的 VETOED 记录（仅用于续跑标记）
+        # 拆分：被否决（记录真实原因，供审计/续跑）+ 通过
+        # 旧实现直接丢掉被否决行，导致「谁被什么条件筛掉」无法追溯。
         if "veto" in result_df.columns:
-            result_df = result_df[result_df["veto"] != "_vetoed_"].copy()
+            self._tier2_vetoed = result_df[result_df["veto"].notna()].copy()
+            result_df = result_df[result_df["veto"].isna()].copy()
         result_df = result_df.drop(columns=["veto"], errors="ignore")
         if result_df.empty:
             return pd.DataFrame()
@@ -1834,8 +2229,9 @@ class TushareScreener:
         # Select display columns
         display_cols = [c for c in [
             "ts_code", "name", "industry", "close", "pe_ttm", "pb", "dv_ttm",
-            "roe_waa", "gross_margin", "fcf_yield", "fcf_margin",
+            "roe_waa", "roe_refined", "gross_margin", "fcf_yield", "fcf_margin",
             "R_coarse", "R_refined", "R_divergence", "payout_ratio",
+            "M_refined", "M_refined_median", "M_refined_flag",
             "alloc_years", "alloc_fcf_neg_years", "alloc_fin_pos_years",
             "ev_ebitda", "floor_premium", "composite_score"
         ] if c in df.columns]
@@ -1882,7 +2278,9 @@ def main():
     parser.add_argument("--tier2-limit", type=int, default=None,
                         help="Limit number of stocks for Tier 2 (default: 200)")
     parser.add_argument("--min-roe", type=float, default=None,
-                        help="Override minimum ROE threshold (%%)")
+                        help="Override Tier1 COARSE ROE threshold (%%) [default 6]")
+    parser.add_argument("--min-roe-refined", type=float, default=None,
+                        help="Override Tier2 REFINED ROE threshold (%%) [default 8]")
     parser.add_argument("--max-pe", type=float, default=None,
                         help="Override maximum PE threshold")
     parser.add_argument("--min-gross-margin", type=float, default=None,
@@ -1904,6 +2302,8 @@ def main():
     overrides = {}
     if args.min_roe is not None:
         overrides["min_roe"] = args.min_roe
+    if args.min_roe_refined is not None:
+        overrides["min_roe_refined"] = args.min_roe_refined
     if args.max_pe is not None:
         overrides["max_pe"] = args.max_pe
     if args.min_gross_margin is not None:
@@ -1948,9 +2348,11 @@ def main():
 
     # Display top results
     display_cols = [c for c in [
-        "ts_code", "name", "industry", "composite_score", "roe_waa",
+        "ts_code", "name", "industry", "composite_score",
+        "roe_waa", "roe_refined", "roe_refined_end", "roe_refined_flag",
         "fcf_yield", "fcf_margin", "R_coarse", "R_refined", "R_divergence",
-        "payout_ratio", "ev_ebitda", "floor_premium"
+        "payout_ratio", "M_refined", "M_refined_avg", "M_refined_latest",
+        "ev_ebitda", "floor_premium"
     ] if c in result.columns]
     print("\n" + result[display_cols].head(20).to_string(index=False))
 

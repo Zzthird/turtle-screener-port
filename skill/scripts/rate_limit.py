@@ -50,6 +50,18 @@ BACKOFF_MAX = _env_float("RATE_LIMIT_BACKOFF_MAX", 30.0)
 COOLDOWN_SECONDS = _env_float("RATE_LIMIT_COOLDOWN", 120.0)
 # 分页抓取每页间隔（秒）
 PAGE_INTERVAL = _env_float("RATE_LIMIT_PAGE_INTERVAL", 0.35)
+# 【东财（AkShare *_em 系列）专用间隔】（秒）—— 默认 1s
+# 背景：AkShare 的 stock_yjbb_em / stock_fhps_em / stock_zcfz_em 等 *_em
+#       接口均直连东财数据中心（datacenter-web.eastmoney.com），且【逐页翻页】
+#       都是【真实 HTTP 请求】（非本地分页，pageSize=500，实测
+#       yjbb 24 页/次、fhps 8 页/年），无本地缓存。
+#       东财对数据中心有频率风控（IP 级），密集翻页易触发限流。
+# 取值：1s/页。为什么不取 3s：逐页 3s 下总耗时 ~3.2 分钟（64 页）
+#       不可接受；1s/页 下 ~64s，兼顾保护与速度。
+# 覆盖：Tier1 的财务（yjbb_em 1 次）+ 分红（fhps_em 5 年）均走此间隔。
+EM_MIN_INTERVAL = _env_float("RATE_LIMIT_EM_INTERVAL", 1.0)
+# 东财域名标识（throttle 按域名分桶）
+EM_DOMAIN = "eastmoney"
 # 全市场快照磁盘缓存 TTL（秒）——默认 6 小时，避免同日重复拉取
 SNAPSHOT_TTL = _env_float("SCREENER_SNAPSHOT_TTL", 6 * 3600)
 # 分页上限（防一次性狂拉；设为 0 表示不限）

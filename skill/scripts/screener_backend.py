@@ -851,72 +851,241 @@ class FreeScreenerBackend:
         self._pledge_all = out
         return out
 
-    # -- 单股财务指标 ---------------------------------------------------
-    # -- 全市场财务指标（Tier1 前移质量门槛用）------------------------
-    def fina_indicator_all(self, year: int = None) -> pd.DataFrame:
-        """全市场【年度】财务指标（一次拉取）。
+    @staticmethod
+    def _em_throttle():
+        """对东财数据中心接口做节流（单次调用前）。默认 1s/次。"""
+        try:
+            from rate_limit import throttle, EM_MIN_INTERVAL, EM_DOMAIN
+            throttle(EM_DOMAIN, EM_MIN_INTERVAL)
+        except Exception:                              # noqa: BLE001
+            pass
 
-        用于把 Tier2 的 ROE / 毛利率 / 资产负债率门槛【前移到 Tier1】：
-        这三项都是硬门槛，提前过滤可避免低质量股占用 Tier2 名额。
+    # ⚠️ 【切勿再实现对 AkShare 内部翻页的 monkey-patch】(2026-02)
+    #   曾用上下文管理器把 akshare.stock_feature.stock_fhps_em 的
+    #   `requests.get` 包一层来"逐页节流"，结果【卡死】：
+    #     ① 该模块的 `requests` 是【全局共享对象】，改它等于改全局；
+    #     ② 闭包里捕获的 orig 是 patch 当时的 get，5 年循环反复进出
+    #        造成【自我套娃】（第2次的 orig 已是第1次的包装函数），
+    #        每层各等 1s → 等待时间累加，40 页后实质死锁。
+    #   现改为【只在每次接口调用前节流】（_em_throttle），
+    #   不做逐页介入。东财一次调用 ~8-24 页，1s/次的代价可接受。
 
-        ⚠️ zzshare finance_indicator 的 roe 是【单季值】（实测茅台 2025q4
-        为 7.05、2023q4 为 10.08），必须**累加 4 个季度**才是年度 ROE。
-        已实测：茅台 10.93+7.47+7.76+7.05 = 33.21（年度值同为 33.21）
-                沪农商行 2.87+2.74+2.81+1.38 = 9.80（同为 9.80）
-        毛利率/净利率本身是年度值，取 q4 即可。
+    # -- 全市场批量：速动比率（智兔 /hicw/cznl，一次 5000 只）----------
+    def quick_ratio_all(self, year: int = None) -> pd.DataFrame:
+        """全市场【速动比率 + 资产负债率】（智兔 /hicw/cznl/{年}/4）。
+
+        实测 2024_4 字段：
+          ldbl  流动比率
+          sdbl  速动比率     ← 本方法主取
+          xjbl  现金比率
+          lxbs  利息倍数
+          gdbl  股东权益比率
+          zcfzl 资产负债率
+
+        实测值：神华 2.08 / 宇通 1.21 / 伊利 0.62
+
+        ⚠️【银行整条缺记录】(与 /hicw/cznl 的已知行为一致，招行不在返回里)。
+           故金融股必须【跳过速动比率门槛】，否则会被整批误杀。
 
         Returns:
-            DataFrame[ts_code, roe_waa, grossprofit_margin, netprofit_margin, end_date]
+            DataFrame[ts_code, quick_ratio, current_ratio, cash_ratio,
+                      equity_ratio, debt_to_assets_cznl]
+            缺失（含银行）→ 不出现在表中，由调用方豁免
+        """
+        if getattr(self, "_qr_all", None) is not None:
+            return self._qr_all
+        out = pd.DataFrame()
+        try:
+            d, _y = self._hicw_fetch("cznl", year)
+            if isinstance(d, list) and d:
+                df = pd.DataFrame(d)
+                tmp = pd.DataFrame()
+                tmp["ts_code"] = df["dm"].astype(str).map(self._to_ts)
+                for src, dst in (("sdbl", "quick_ratio"),
+                                 ("ldbl", "current_ratio"),
+                                 ("xjbl", "cash_ratio"),
+                                 ("gdbl", "equity_ratio"),
+                                 ("zcfzl", "debt_to_assets_cznl")):
+                    tmp[dst] = pd.to_numeric(df.get(src), errors="coerce")
+                out = tmp.drop_duplicates("ts_code")
+                if self.verbose:
+                    print(f"[free-backend] 速动比率来源: 智兔 cznl "
+                          f"({len(out)} 只，含银行缺失)")
+        except Exception as e:                        # noqa: BLE001
+            if self.verbose:
+                print(f"[free-backend] cznl 失败: {str(e)[:70]}")
+            out = pd.DataFrame()
+        self._qr_all = out
+        return out
+
+    # -- 【已禁用】经营现金流批量（zzshare 数据错误）-----------------
+    def ocf_all(self, years: int = 5, end_year: int = None) -> pd.DataFrame:
+        """【已禁用】原为「Σ5年OCF ≥ Σ5年分红」质量判据供数。
+
+        🚫 为何禁用（2026-02）：zzshare finance_cash_flow 的
+           `net_operate_cash_flow` 实测【数据错误】。
+           实测宇通客车 600066（单位：亿元）：
+             年份    zzshare    新浪（正确）   公开财报
+             2021    -0.06        7.16         7.16
+             2022    28.19       32.54        32.54
+             2023    -4.60       47.17        47.17   ← 【连符号都相反】
+             2024    26.75       72.11        72.11
+           → 5 年累计：zzshare 64.3 亿 vs 实际 194.7 亿（少算 2/3）
+           用该数据做门槛会把「造血充足」的宇通误判为「吃老本」而剔除。
+
+        ❌ 全市场批量源里无正确的 OCF 绝对额：
+             - zzshare finance_cash_flow  数据错（如上）
+             - 智兔 /hicw/xj              只有比率（OCF/净利），无绝对值
+             - 新浪 stock_financial_report_sina  准确但为【单股】接口
+
+        ✅ 若将来要恢复该判据，两条路：
+             ① 找到批量且准确的 OCF 源
+             ② 移到 Tier2（那里已有逐股新浪现金流表，算 AA 时本就在拉）
+
+        现恒返回空表，调用方应能正确处理（不会因缺数据而误杀）。
+        """
+        return pd.DataFrame(columns=["ts_code", "ocf_5y"])
+
+    # -- 全市场批量：5 年分红（AkShare stock_fhps_em）------------------
+    def dividend_all_5y(self, years: int = 5, end_year: int = None) -> pd.DataFrame:
+        """全市场【近 N 年分红 + 每股收益 + 总股本】（AkShare stock_fhps_em）。
+
+        为何用 stock_fhps_em 而非智兔 yjbb：
+          - 智兔 yjbb 只有【单年一条分红方案】，实测伊利 2025 漏计导致
+            偏差 26pp（批量 49.18% vs 逐股 75.48%）
+          - fhps_em 字段齐全：现金分红比例 / 每股收益 / 总股本 / 方案进度
+            → 能算真·累计口径（分红总额 = 每股分红 × 总股本）
+
+        ⚠️ 只返回【有分红】的股票（约 3650/5173）；未出现 = 未分红 = M 按 0 处理。
+        ⚠️ 东财接口：仅在【5 年循环开始前】节流一次（默认 1s），
+           不做逐页介入（参见 _em_throttle 上方警示注释）。
+
+        Returns:
+            DataFrame[ts_code, year, dps, eps, total_share,
+                      div_total_mm, np_mm, payout, prog]
+            单位：div_total_mm / np_mm = 百万元
+        """
+        if getattr(self, "_div5y", None) is not None:
+            return self._div5y
+        if end_year is None:
+            end_year = self._latest_annual_year(_dt.date.today().year)
+        frames = []
+        try:
+            import akshare as ak
+            # 节流一次即可（5 年循环共享同一间隔预算）
+            self._em_throttle()
+            for i in range(years):
+                y = end_year - i
+                try:
+                    df = ak.stock_fhps_em(date="%d1231" % y)
+                except Exception:                      # noqa: BLE001
+                    continue
+                if df is None or not len(df):
+                    continue
+                tmp = pd.DataFrame()
+                tmp["ts_code"] = df["代码"].astype(str).map(
+                    lambda c: self._to_ts(c))
+                tmp["year"] = y
+                div10 = pd.to_numeric(df.get("现金分红-现金分红比例"),
+                                      errors="coerce")
+                tmp["dps"] = div10 / 10.0           # 每10股派X -> 每股
+                tmp["eps"] = pd.to_numeric(df.get("每股收益"), errors="coerce")
+                tmp["total_share"] = pd.to_numeric(df.get("总股本"), errors="coerce")
+                tmp["prog"] = df.get("方案进度", "").astype(str)
+                tmp["div_total_mm"] = (tmp["dps"] * tmp["total_share"] / 1e6)
+                tmp["np_mm"] = (tmp["eps"] * tmp["total_share"] / 1e6)
+                tmp["payout"] = (tmp["dps"] / tmp["eps"] * 100).where(
+                    tmp["eps"] > 0)
+                frames.append(tmp)
+        except Exception as e:                        # noqa: BLE001
+            if self.verbose:
+                print(f"[free-backend] fhps_em 失败: {str(e)[:70]}")
+            frames = []
+        out = (pd.concat(frames, ignore_index=True) if frames
+               else pd.DataFrame())
+        self._div5y = out
+        return out
+
+    # -- 单股财务指标 ---------------------------------------------------
+    # -- 全市场财务指标（Tier1 质量门槛用，2026-02 换源）--------------
+    def fina_indicator_all(self, year: int = None) -> pd.DataFrame:
+        """全市场【年度】财务指标（AkShare stock_yjbb_em，一次批量）。
+
+        ⚠️ 【2026-02 换源】：旧实现用 zzshare finance_indicator 的 roe
+        单季值×4 季相加，存在两个缺陷：
+          ① nq<4 时静默部分相加 → 系统性低估（实测 91 只）
+          ② 单季之和 ≠ 年报加权 ROE（口径不同，门槛附近会翻盘）
+        现改用 stock_yjbb_em 的【净资产收益率】（东财【加权】口径）：
+          实测 2024 年报：伊利 15.81 / 神华 13.55 / 招行 14.49
+          与人工核对值一致。注意招行是 14.49（加权）而非 12.10（摊薄）。
+
+        ⚠️ stock_yjbb_em 含 北交所/老三板（实测 11651 只中 6150 只），
+           而 Tier1 股票池来自 zzshare 快照（仅沪深 A）→ 只保留 .SH/.SZ。
+        ⚠️ 东财接口：调用前节流一次（默认 1s），不做逐页介入。
+
+        Returns:
+            DataFrame[ts_code, roe_waa, grossprofit_margin,
+                      netprofit_margin, end_date, roe_quarters, _roe_flag,
+                      debt_to_assets, quick_ratio]
+            roe_quarters 恒为 4（年报口径，不再是季度拼凑）
+            _roe_flag: ''          正常
+                       'missing'  无记录
+                       'outlier'  |ROE|>200%
         """
         if getattr(self, "_fi_all", None) is not None:
             return self._fi_all
 
         cur_year = _dt.date.today().year
         if year is None:
-            year = cur_year - 1          # 最近已完成年度
+            year = self._latest_annual_year(cur_year)
 
-        roe_sum: dict = {}
-        q4_df = None
+        out = pd.DataFrame()
         try:
-            from zzshare.client import DataApi
-            api = DataApi(token=os.environ.get("ZZSHARE_TOKEN") or None)
-            for q in (1, 2, 3, 4):
-                try:
-                    df = api.finance_indicator("%dq%d" % (year, q))
-                except Exception:                  # noqa: BLE001
-                    continue
-                if df is None or not len(df):
-                    continue
-                codes = df["code"].astype(str)
-                vals = pd.to_numeric(df.get("roe"), errors="coerce")
-                for c, v in zip(codes, vals):
-                    if v is not None and v == v:
-                        roe_sum[c] = roe_sum.get(c, 0.0) + float(v)
-                if q == 4:
-                    q4_df = df
-        except Exception:                              # noqa: BLE001
-            q4_df = None
-
-        if q4_df is None or not len(q4_df):
+            import akshare as ak
+            self._em_throttle()
+            df = ak.stock_yjbb_em(date="%d1231" % year)
+            if df is not None and len(df):
+                df = df.copy()
+                df["ts_code"] = df["股票代码"].astype(str).map(self._to_ts)
+                # 只留沪深 A（剔除北交所/老三板）
+                df = df[df["ts_code"].str.endswith((".SH", ".SZ"))]
+                # 同股多报告期 -> 按最新公告日期保留最新一条
+                if "最新公告日期" in df.columns:
+                    df = df.sort_values("最新公告日期")
+                df = df.drop_duplicates("ts_code", keep="last")
+                out = pd.DataFrame()
+                out["ts_code"] = df["ts_code"]
+                out["roe_waa"] = pd.to_numeric(
+                    df.get("净资产收益率"), errors="coerce")
+                out["grossprofit_margin"] = pd.to_numeric(
+                    df.get("销售毛利率"), errors="coerce")
+                # 净利率：yjbb_em 无直接字段，用 净利/营收 自算
+                np_val = pd.to_numeric(df.get("净利润-净利润"), errors="coerce")
+                rev = pd.to_numeric(df.get("营业总收入-营业总收入"),
+                                    errors="coerce")
+                out["netprofit_margin"] = (np_val / rev * 100).where(rev > 0)
+                out["end_date"] = "%d1231" % year
+        except Exception as e:                        # noqa: BLE001
+            if self.verbose:
+                print(f"[free-backend] yjbb_em 失败: {str(e)[:80]}")
             out = pd.DataFrame()
+
+        if out.empty:
             self._fi_all = out
             return out
 
-        out = pd.DataFrame({
-            "ts_code": q4_df["code"].astype(str),
-            "grossprofit_margin": pd.to_numeric(
-                q4_df.get("gross_profit_margin"), errors="coerce"),
-            "netprofit_margin": pd.to_numeric(
-                q4_df.get("net_profit_margin"), errors="coerce"),
-            "end_date": "%d1231" % year,
-        })
-        out["roe_waa"] = out["ts_code"].map(roe_sum)
-
-        # 修正明显失真的毛利率（zzshare 实测部分股票 >100%）
+        out["roe_quarters"] = 4       # 年报口径（兼容旧消费方）
+        out["_roe_flag"] = ""
+        bad = out["roe_waa"].notna() & (out["roe_waa"].abs() > 200)
+        out.loc[bad, "roe_waa"] = None
+        out.loc[bad, "_roe_flag"] = "outlier"
+        out.loc[out["roe_waa"].isna() & (out["_roe_flag"] == ""),
+                "_roe_flag"] = "missing"
+        # 修正明显失真的毛利率（实测部分股票 >100%）
         gm = out["grossprofit_margin"]
-        out.loc[gm.notna() & ((gm > 100) | (gm < -100)), "grossprofit_margin"] = None
-
-        # 资产负债率：zzshare balance 表自算（100% 覆盖，含银行）。
+        out.loc[gm.notna() & ((gm > 100) | (gm < -100)),
+                "grossprofit_margin"] = None
+        # 资产负债率：zzshare balance 自算（100% 覆盖，含银行）
         try:
             dz = self.debt_all()
             if dz is not None and len(dz):
@@ -926,9 +1095,59 @@ class FreeScreenerBackend:
                 out["debt_to_assets"] = None
         except Exception:                              # noqa: BLE001
             out["debt_to_assets"] = None
+        # 速动比率（智兔 cznl；银行缺失 -> NaN，由调用方豁免）
+        try:
+            qr = self.quick_ratio_all(year)
+            if qr is not None and len(qr):
+                qi = qr.set_index("ts_code")
+                out["quick_ratio"] = out["ts_code"].map(qi["quick_ratio"])
+            else:
+                out["quick_ratio"] = None
+        except Exception:                              # noqa: BLE001
+            out["quick_ratio"] = None
 
         self._fi_all = out
         return out
+
+    @staticmethod
+    def _latest_annual_year(cur_year: int) -> int:
+        """最近一个【年报已基本披露完毕】的年度。
+
+        不能简单用 cur_year-1：
+        A 股年报法定截止 4/30，故
+          - 1~4 月：上一年年报还没出全，应取 cur_year-2
+          - 5~12 月：cur_year-1 年报已披露，取 cur_year-1
+        实测 2026-02 调旧实现得到 2025 年度，而彼时 2025 年报刚开始披露
+        （覆盖率极低），会大面积误判为「数据缺失」。
+
+        可用 SCREENER_FI_YEAR 环境变量强制指定年份（调试/复现用）。
+        """
+        forced = os.environ.get("SCREENER_FI_YEAR")
+        if forced:
+            try:
+                return int(forced)
+            except ValueError:
+                pass
+        return cur_year - 1 if _dt.date.today().month >= 5 else cur_year - 2
+
+    # -- 【已废弃】Tier2 细筛用年报 ROE（新浪）-----------------------
+    def roe_refined(self, ts_code: str, year: int = None) -> dict:
+        """【已废弃，2026-02】原为 Tier2 细筛供数（新浪「净资产收益率(%%)」）。
+
+        🚫 为何废弃：Tier1 的 ROE 已换成 AkShare stock_yjbb_em
+           （东财【加权】年报口径），实测与人工核对值一致：
+             伊利 15.81 / 神华 13.55 / 招行 14.49
+           而本方法取的新浪「净资产收益率(%%)」是【摊薄】口径，实测：
+             伊利 15.89 / 神华 13.74 / 招行 12.10（招行与加权差 2.39pp）
+           与项目采用的口径不符。
+        两级设计的根因（两源口径差 2pp）已消失，故 Tier2 改为直接复用
+        Tier1 的 roe_waa。本方法保留仅为兼容，调用方不再使用。
+
+        ⚠️ 如将来要恢复逐股 ROE 复核，务必先确认口径（加权 vs 摊薄），
+           两者对应不同列，混用会造成同一报告出现两个 ROE。
+        """
+        return {"roe_refined": None, "end_date": "",
+                "refined_flag": "deprecated", "refined_src": "sina"}
 
     def fina_indicator(self, ts_code: str, periods: int = 5) -> pd.DataFrame:
         """单股财务指标（近 N 年）。列对齐 Tushare 常用子集。"""
