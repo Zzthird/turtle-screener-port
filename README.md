@@ -1,5 +1,24 @@
 # TurtlePi
 
+> ## 来源与授权状态
+>
+> **本项目基于 [terancejiang/Turtle_investment_framework](https://github.com/terancejiang/Turtle_investment_framework) v2.x 移植与改造。**
+>
+> 上游项目当前**未附加开源许可证**（`license: null`）。本仓库用于个人学习与技术验证，**不作商业用途**。
+> 若上游作者对二次分发有不同意见，请通过 issue 联系，我会立即调整。
+>
+> **上游原有内容**：`skill/shared/`、`skill/strategies/`、`skill/references/` 下的框架脚本与文档（74 个文件作为基线）。
+>
+> **本仓库中由本人完成的工作**：
+> - 将整套框架从 Claude Code 环境移植到本地 **pi** AI 编程助手环境（命令模板、子代理编排、路径适配）
+> - **数据层重写**：把付费的 Tushare 数据源替换为新浪 / 同花顺 / 雪球 / 智兔 / 巨潮 PDF 五个免费源，含多源轮换与失败降级
+> - **请求限流与断点续跑**：单源节流、连续失败自动暂停、Tier2 进度持久化
+> - **数据校验与纠错**：科目名口径对齐、门槛生效验证、误差回归（详见下方「与上游的差异」）
+>
+> 开发方式说明：代码由 AI 编程助手根据本人的需求定义与验收结果生成，本人负责数据源调研、接口实测、结果校验与取舍决策。
+
+---
+
 把 **龟龟投资框架 v2.x** 从 Claude Code 移植到 **pi** 的开发工作区。
 
 > 主干唯一：`terancejiang/Turtle_investment_framework` (v2.1-beta)
@@ -174,3 +193,26 @@ SCREENER_MAX_CONSEC_FAIL=5     连续失败阈值
 ---
 
 *最后更新：多源轮换 + 断点续跑 + 全量 Tier2 跑通（931 只 → 390 只通过）*
+
+---
+
+## 与上游的差异
+
+本人相对上游 `Turtle_investment_framework` v2.x 的改动（按 `git diff` 统计）：
+
+| 类别 | 数量 |
+|---|---|
+| 新增文件 | 52 |
+| 修改的上游文件 | 17 |
+| 删除文件 | 0 |
+
+主要改动集中在以下模块：
+
+- **`skill/scripts/screener_core.py`** —— Tier1/Tier2 选股主逻辑，门槛判定、否决门、断点续跑
+- **`skill/scripts/screener_backend.py`** —— 免费数据源后端（快照 / 分红 / 质押 / 负债率）
+- **`skill/scripts/datasource/adapters/akshare_adapter.py`** —— 三表多源接入与轮换
+- **`skill/scripts/rate_limit.py`** —— 请求节流与连续失败保护
+- **`skill/scripts/pdf_parent_extractor.py`** —— 巨潮年报 PDF 母公司报表提取（新增）
+- **`notes/`** —— 数据源实测与验证记录（新增）
+
+`skill/shared/`、`skill/strategies/`、`skill/references/` 下的内容保持上游原样。
